@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1028259081.svg)](https://doi.org/10.5281/zenodo.16567312)
+
 # photocatalysis-europe
 
 Here you find the code to create all figures and do the required data transformations and calculations to get the aggregated data for the paper: "Impacts of photocatalytic hydrogen production on the European energy system"
