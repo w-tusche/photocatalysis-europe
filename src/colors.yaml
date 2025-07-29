@@ -1,0 +1,30 @@
+tech_colors:
+    # wind
+    onwind: "#74BBCD"
+    offwind: "#4F88B9"
+    H2 Electrolysis: "#874037"
+    # H2 Electrolysis: "#733957"
+#    H2 Electrolysis: "#ff29d9"
+    photocatalysis: "#C3A34B"
+    # photocatalysis: "#A3672C"
+    # photocatalysis: "#dbd40c"
+    solar: "#A3672C"
+    # solar: "#C3A34B"
+    hydrogen: "#B4DEC6"
+    electricity: "#5C538B"
+    H2 Fuel Cell: "#805394"
+    H2 turbine: "#380282"
+    H2 pipeline (total): "#b3f3f4"
+    H2 pipeline (repurposed): "#499a9c"
+
+others:
+  node density: "#D6D893"
+  land area density: "#733957"
+  generation installation: "#103F60"
+  annualized costs: "#9D892B"
+  pc-50: "#D29343"
+  pc-0: "#FACCFA"
+  difference: "#FACCFA"
+  h2_storage: "blue"
+  no_UGHS_line: "#F8A17B"
+  UGHS_line: "#011959" # and market share

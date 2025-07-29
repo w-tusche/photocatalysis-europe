@@ -1,0 +1,45 @@
+# Config Setup
+config.py
+
+__pycache__/
+
+# All Hidden Folders
+.*/
+
+# Except .vscode
+!.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# Ignore Log files
+*.log
+
+# Ignore .bak files
+*.bak
+
+# Ignore thumbinail files
+*Thumbs.db
+
+# Ignore Log files
+*.html
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ignore raw result nc files.
+results/raw/150_lv1.25_I_H_2045_3H_PC_650Euro/elec_s_150_lv1.25__I-H_2045.nc
+results/raw/150_lv1.25_I_H_2045_3H_PC_925Euro/elec_s_150_lv1.25__I-H_2045.nc
+
+# Negate a rule
+!.gitignore

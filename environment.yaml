@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: : 2017-2024 The PyPSA-Eur Authors
+#
+# SPDX-License-Identifier: CC0-1.0
+
+name: pypsa-pc-plots
+channels:
+- conda-forge
+dependencies:
+- python>=3.8
+- pip
+
+- pypsa
+
+- pandas>=2.1
+- numpy < 2
+
+- matplotlib
+- geopandas>=0.11.0
+- seaborn
+- cartopy
+- cmcrameri  # for scientific color maps
+- networkx
+- yaml
+- shapely
+
+- pre-commit
+- black
+
+  # Keep in conda environment when calling ipython
+- ipython
+- jupyter
+- ipykernel
