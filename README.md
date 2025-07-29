@@ -13,7 +13,7 @@ To implement photocatalysis in the optimization model the technology was added i
 - [PyPSA-Eur-PC](https://github.com/w-tusche/pypsa-eur-pc)
 - [atlite-pc](https://github.com/w-tusche/atlite-pc.git)
 
-The raw results of the two main scenarios PC-0 and PC-50 are published on zenodo: [Raw data of PC-0 and PC-50 cases for paper: Impacts of photocatalytic hydrogen production on the European energy system](https://10.5281/zenodo.16360844). All other raw data will be made available on reasonable request.
+The raw results of the two main scenarios PC-0 and PC-50 are published on zenodo: [Raw data of PC-0 and PC-50 cases for paper: Impacts of photocatalytic hydrogen production on the European energy system](https://doi.org/10.5281/zenodo.16360844). All other raw data will be made available on reasonable request.
 
 A summary of all data is in `results/total_eval.csv` and `results/total_summary.csv` with the corresponding extraction script: `src/create_basic_summary.py`.
 
@@ -48,7 +48,7 @@ mamba env create -f envs/environment.yaml  # general
 mamba activate pypsa-pc-plots
 ```
 
-Now go to [Raw data of PC-0 and PC-50 cases for paper: Impacts of photocatalytic hydrogen production on the European energy system](https://10.5281/zenodo.16360844), download the raw data and place the .nc files from the folders `150_lv1.25_I_H_2045_3H_PC_925Euro` and `150_lv1.25_I_H_2045_3H_PC_650Euro` in the respective folder under `results/raw/`
+Now go to [Raw data of PC-0 and PC-50 cases for paper: Impacts of photocatalytic hydrogen production on the European energy system](https://doi.org/10.5281/zenodo.16360844), download the raw data and place the .nc files from the folders `150_lv1.25_I_H_2045_3H_PC_925Euro` and `150_lv1.25_I_H_2045_3H_PC_650Euro` in the respective folder under `results/raw/`
 
 Once you have done all this you may run the `plots.py` script to recreate all plots, from here on you can explore the post-processing steps for each plot.
 
