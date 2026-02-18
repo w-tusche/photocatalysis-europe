@@ -375,4 +375,3 @@ dependencies:
       - python-slugify==8.0.4
       - rich==14.0.0
       - text-unidecode==1.3
-prefix: C:\Users\wolfram_t\AppData\Local\miniforge3\envs\pypsa-plots

@@ -26,6 +26,7 @@ The following structure of the (sub)directories is required:
         └── total_summary.csv
 """
 
+import gc
 import os
 
 import networkx as nx
@@ -207,6 +208,8 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
     Exception
         If a sub-directory contains more than one .nc-file, an exception is raised.
     """
+    total_summary_df = None
+    total_eval_df = None
 
     try:
         tot_sum = pd.read_csv(
@@ -247,6 +250,9 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
 
         # import the PyPSA-Eur results
         try:
+            print(
+                f"Importing the following file: {os.path.join(raw_files_folder, subfolder, pypsa_files[0])}"
+            )
             n = pypsa.Network(os.path.join(raw_files_folder, subfolder, pypsa_files[0]))
         except IndexError as e:
             print(
@@ -643,6 +649,10 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
 
             total_summary_df.to_csv(os.path.join(results_folder, "total_summary.csv"))
             total_eval_df.to_csv(os.path.join(results_folder, "total_eval.csv"))
+
+        # Clean up (alternatively I could encapsulate the file processing in a function)
+        del n  # delete dataframe from RAM to stop clogging it
+        gc.collect()  # call garbage collector
 
     if tot_sum is not None and re_create_tot_sum == False:
         # Append data

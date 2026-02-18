@@ -19,7 +19,7 @@ BUS_LOCATIONS_PATH = r"./data/bus_locations.csv"
 REGIONS_GEOJSON_PATH = r"./data/regions_onshore_elec_s_150.geojson"
 SUMMARY_PATH = r"./results/total_summary.csv"
 COLOR_DEFINITION_PATH = r"./src/colors.yaml"
-SKIP_KEYWORDS = ["6pct", "3pct", "900", "925", "_net_zero"]
+SKIP_KEYWORDS = ["6pct", "3pct", "900", "925", "_net_zero", "_vopt", "_CCS", "_wind"]
 
 
 # --- Helper functions ---
@@ -370,7 +370,7 @@ def prepare_all_data():
         demand_violin_df_horizontal, "PC capex", capex_annualized_cost_map
     )
 
-    base_index, _, _, _, _ = get_base_index(total_summary_df)
+    base_index, *_ = get_base_index(total_summary_df)
 
     with open(COLOR_DEFINITION_PATH) as stream:
         colors_dict = yaml.safe_load(stream)

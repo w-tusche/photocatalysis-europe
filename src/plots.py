@@ -114,6 +114,12 @@ def get_base_index(df: pd.DataFrame):
         "pct3": "_3pct",
         "pct6": "_6pct",
         "net_zero": "net_zero",
+        "vopt": "_vopt",
+        "wind_1_2": "_wind_1_2",
+        "CCS_50": "_CCS_50",
+        "CCS_100": "_CCS_100",
+        "CCS_300": "_CCS_300",
+        "CCS_400": "_CCS_400",
     }
 
     # Create a dictionary to hold the indices for each scenario
@@ -134,6 +140,12 @@ def get_base_index(df: pd.DataFrame):
         scenario_indices["pct6"],
         scenario_indices["pct3"],
         scenario_indices["net_zero"],
+        scenario_indices["vopt"],
+        scenario_indices["wind_1_2"],
+        scenario_indices["CCS_50"],
+        scenario_indices["CCS_100"],
+        scenario_indices["CCS_300"],
+        scenario_indices["CCS_400"],
     )
 
 
@@ -234,7 +246,7 @@ def market_share(
         par2.axis["bottom3"].major_ticklabels.set_visible(True)
         par2.axis["bottom3"].set_visible(True)
 
-    base_index, noUGHS_index, pct6_index, pct3_index, _ = get_base_index(df)
+    base_index, noUGHS_index, pct6_index, pct3_index, *_ = get_base_index(df)
 
     host.set(
         xlim=[115, 172.5],
@@ -308,14 +320,16 @@ def market_share(
 
     host.legend(
         handles=[base, pct6, pct3, noUGHS] if all else [base],
-        labels=[
-            r"$STH=10~\mathrm{\%}$",
-            r"$STH=6~\mathrm{\%}$",
-            r"$STH=3~\mathrm{\%}$",
-            "$STH=10~\mathrm{\%}$,\nno UGHS",
-        ]
-        if all
-        else [r"$STH=10~\mathrm{\%}$"],
+        labels=(
+            [
+                r"$STH=10~\mathrm{\%}$",
+                r"$STH=6~\mathrm{\%}$",
+                r"$STH=3~\mathrm{\%}$",
+                "$STH=10~\mathrm{\%}$,\nno UGHS",
+            ]
+            if all
+            else [r"$STH=10~\mathrm{\%}$"]
+        ),
         loc="upper center",
         bbox_to_anchor=(0.5, -0.11),
         ncol=4,
@@ -382,9 +396,11 @@ def market_share(
     save_or_plot_img(
         fig,
         output_folder_path,
-        "market_share_over_annualized_PC_cost"
-        if all
-        else "market_share_over_annualized_PC_cost_only_10",
+        (
+            "market_share_over_annualized_PC_cost"
+            if all
+            else "market_share_over_annualized_PC_cost_only_10"
+        ),
         save=save,
     )
 
@@ -428,7 +444,7 @@ def system_development(
     par3.axis["right2"].major_ticklabels.set_visible(True)
     par3.axis["right2"].set_visible(True)
 
-    (base_index, _, _, _, _) = get_base_index(df)
+    base_index, *_ = get_base_index(df)
 
     host.set(
         xlim=[115, 172.5],
@@ -844,20 +860,18 @@ def prepare_LCOH_violin_data(
             columns=[
                 r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$",
                 "Capacity",
-                r"LCOH in € kg$^{-1}$",
+                r"$LCOH$ in € kg$^{-1}$",
                 "Technology",
             ],
         )
-        capacity_df[
-            r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$"
-        ] = capacity_df[
-            r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$"
-        ].astype(
-            np.float64
+        capacity_df[r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$"] = (
+            capacity_df[
+                r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$"
+            ].astype(np.float64)
         )
         capacity_df["Capacity"] = capacity_df["Capacity"].astype(np.float64)
-        capacity_df[r"LCOH in € kg$^{-1}$"] = capacity_df[
-            r"LCOH in € kg$^{-1}$"
+        capacity_df[r"$LCOH$ in € kg$^{-1}$"] = capacity_df[
+            r"$LCOH$ in € kg$^{-1}$"
         ].astype(np.float64)
         capacity_df["Technology"] = capacity_df["Technology"].astype(str)
 
@@ -869,11 +883,11 @@ def prepare_LCOH_violin_data(
             1
         )
         capacity_df.loc[: len(el_cap) - 1, "Capacity"] = el_cap
-        capacity_df.loc[: len(el_LCOH) - 1, r"LCOH in € kg$^{-1}$"] = el_LCOH
+        capacity_df.loc[: len(el_LCOH) - 1, r"$LCOH$ in € kg$^{-1}$"] = el_LCOH
         capacity_df.loc[: len(el_cap) - 1, "Technology"] = "Electrolysis"
 
         capacity_df.loc[len(el_cap) :, "Capacity"] = pc_cap
-        capacity_df.loc[len(el_cap) :, r"LCOH in € kg$^{-1}$"] = pc_LCOH
+        capacity_df.loc[len(el_cap) :, r"$LCOH$ in € kg$^{-1}$"] = pc_LCOH
         capacity_df.loc[len(el_cap) :, "Technology"] = "Photocatalysis"
 
         if ind_iterator == 0:
@@ -893,10 +907,11 @@ def plot_LCOH_violins_of_electrolysis_and_photocatalysis(
     UGHS_line_color,
     represent_regarding_market_share,
     line_cost_or_market_share,
+    violin_edge=False,
     save=False,
 ):
     # get nodal data
-    base_index, _, _, _, _ = get_base_index(df)
+    base_index, *_ = get_base_index(df)
 
     total_LCOH_df = prepare_LCOH_violin_data(
         df=df,
@@ -924,7 +939,7 @@ def plot_LCOH_violins_of_electrolysis_and_photocatalysis(
     sns.violinplot(
         data=total_LCOH_df,
         x=r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$",
-        y=r"LCOH in € kg$^{-1}$",
+        y=r"$LCOH$ in € kg$^{-1}$",
         hue="Technology",
         palette={
             "Electrolysis": tech_colors["H2 Electrolysis"],
@@ -940,6 +955,7 @@ def plot_LCOH_violins_of_electrolysis_and_photocatalysis(
         ax=ax,
         native_scale=True,
     )
+
     if represent_regarding_market_share:
         ax.set_xlabel("Photocatalysis market share in \%")
 
@@ -964,6 +980,11 @@ def plot_LCOH_violins_of_electrolysis_and_photocatalysis(
             alpha=0.7,
             label=ax2_label,
         )
+
+    if violin_edge == False:
+        # Remove edgecolor (outline) from violin bodies
+        for violin_body in ax.collections:
+            violin_body.set_edgecolor("none")
 
     ### Add description for PC-0 and PC-50 cases
     if represent_regarding_market_share:
@@ -1006,9 +1027,7 @@ def plot_LCOH_violins_of_electrolysis_and_photocatalysis(
 
     ax.legend(
         ax_handles + ax2_handles,
-        (
-            ["Electrolysis", "Photocatalysis"] + ax2_legend
-        ),
+        (["Electrolysis", "Photocatalysis"] + ax2_legend),
         loc="center",
         bbox_to_anchor=(0.5, -0.18),
         ncols=3,
@@ -1020,7 +1039,11 @@ def plot_LCOH_violins_of_electrolysis_and_photocatalysis(
 
 
 def hydrogen_generation_and_demand_violins_vertical(
-    output_folder_path, represent_regarding_market_share, line_cost_or_market_share, save=False
+    output_folder_path,
+    represent_regarding_market_share,
+    line_cost_or_market_share,
+    violin_edge=False,
+    save=False,
 ):
     import hydrogen_gen_and_dem_violins
 
@@ -1061,7 +1084,7 @@ def hydrogen_generation_and_demand_violins_vertical(
         figsize=set_size(use=True, fraction=2, subplots=(nrows, ncols)),
         ncols=ncols,
         nrows=nrows,
-        width_ratios=[0.75, 0.25],
+        width_ratios=[0.82, 0.18],
     )
 
     # Violin for Electrolysis H2 generation (aim to have it on the left side)
@@ -1271,7 +1294,7 @@ def hydrogen_generation_and_demand_violins_vertical(
     handles2, labels2 = ax1_2.get_legend_handles_labels()  # H2 Demand
     if line_cost_or_market_share:
         handles3, labels3 = ax1_y2.get_legend_handles_labels()  # Market share
-    else: 
+    else:
         handles3 = labels3 = []
 
     # Combine and deduplicate
@@ -1348,6 +1371,15 @@ def hydrogen_generation_and_demand_violins_vertical(
         left=True,
         right=True,
     )
+
+    if violin_edge == False:
+        # Remove edgecolor (outline) from violin bodies
+        for violin_body in ax1.collections:
+            violin_body.set_edgecolor("none")
+        for violin_body in ax1_2.collections:
+            violin_body.set_edgecolor("none")
+        for violin_body in ax2.collections:
+            violin_body.set_edgecolor("none")
 
     # TODO: When changing this the first value in ax1_2.set_xlim() has to be changed!
     plt.subplots_adjust(wspace=0.215)
@@ -1891,6 +1923,80 @@ def plot_system_cost_differences_bars(
     save_or_plot_img(fig, output_folder_path, "system_cost_difference", save=save)
 
 
+def plot_hydrogen_salt_cavern_storage_potential(output_folder_path, scale, save):
+    from plot_cavern_storage_potential import load_hydrogen_salt_cavern_data
+
+    (
+        bus_regions_onshore,
+        cavern_potential_by_region_gdf,
+        caverns,
+    ) = load_hydrogen_salt_cavern_data()
+
+    proj = ccrs.PlateCarree()
+
+    fig, ax = plt.subplots(
+        figsize=set_size(use=True, subplots=(1, 1), fraction=2, scale=scale),
+        subplot_kw={"projection": proj},
+    )
+    ax.set_extent([-10, 26.5, 34.7, 62])
+
+    bus_regions_onshore.boundary.plot(
+        ax=ax,
+        color="black",
+        linewidth=0.1,
+    )
+
+    cmap = "cmc.grayC_r"
+    vmin = 1  # log Norm: vmin has to be > 0
+
+    cavern_potential_by_region_gdf.plot(
+        "all",
+        ax=ax,
+        cmap=cmap,
+        linewidths=0,
+        legend=True,
+        vmin=vmin,
+        norm=mcolors.LogNorm(
+            vmin=vmin, vmax=cavern_potential_by_region_gdf["all"].max()
+        ),
+        # vmax=100,
+        legend_kwds={
+            "label": "Hydrogen storage potential in TWh",
+        },
+        # **map_opts
+    )
+
+    energy_density_col = "val_kwhm3"
+    # get distinct values
+    unique_values = sorted(caverns[energy_density_col].unique())
+    color_list = cmcrameri.cm.roma(np.linspace(0, 1, len(unique_values)))
+    color_map = dict(zip(unique_values, color_list))
+    caverns["color"] = caverns[energy_density_col].map(color_map)
+    caverns.plot(
+        "val_kwhm3",
+        ax=ax,
+        color=caverns["color"],
+    )
+
+    # Energy density legend
+    legend_handles = [
+        patches.Patch(color=color_map[val], label=str(val)) for val in unique_values
+    ]
+    ax.legend(
+        bbox_to_anchor=(0, 1),
+        handles=legend_handles,
+        title="Energy density\npotential\nin $\mathrm{kWh~m^{-3}}$",
+        loc="upper right",
+    )
+
+    ax.set_facecolor("white")
+    plt.show()
+
+    save_or_plot_img(
+        fig, output_folder_path, "hydrogen_salt_cavern_storage_potential", save=save
+    )
+
+
 def main():
     mpl.rcParams.update(pgf_with_latex)
     filepath = os.path.join(r"./results/total_summary.csv")
@@ -1936,6 +2042,7 @@ def main():
         UGHS_line_color,
         represent_regarding_market_share=True,
         line_cost_or_market_share=False,
+        violin_edge=False,
         save=True,
     )
 
@@ -1946,17 +2053,24 @@ def main():
 
     ### Large plots (2 columns)
 
-    # TODO: fix that saved figure and shown figure look the same.
     plot_electrolysis_only_vs_balanced_mix_map(
         n_el, n_mix, regions, tech_colors, output_folder_path, save=True
     )
 
     hydrogen_generation_and_demand_violins_vertical(
-        output_folder_path, represent_regarding_market_share=True,line_cost_or_market_share=False, save=True
+        output_folder_path,
+        represent_regarding_market_share=True,
+        line_cost_or_market_share=False,
+        violin_edge=False,
+        save=True,
     )
 
     # Manually slightly changed in inkscape
-    plot_installed_capacities_bars(output_folder_path, represent_regarding_market_share=True,save=True)
+    plot_installed_capacities_bars(
+        output_folder_path, represent_regarding_market_share=True, save=True
+    )
+
+    plot_hydrogen_salt_cavern_storage_potential(output_folder_path, scale=1, save=True)
 
 
 if __name__ == "__main__":

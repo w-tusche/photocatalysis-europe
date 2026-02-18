@@ -6,7 +6,9 @@ Here you find the code to create all figures and do the required data transforma
 
 In the paper photocatalysis was introduced to the energy system optimization model PyPSA-Eur to analyze the systematic impacts of rising shares of photocatalysis in the European energy system.
 
-With the code and data in this repository all post-processing steps are published and all plots can be created with the data available on zenodo without running other software. For this, the .nc files from zenodo have to be placed in the respective folders in this repository under 'results/raw/' (see usage)
+With the code and data in this repository all post-processing steps are published and all plots from the main manuscript can be created with the data available on zenodo without running other software. For this, the .nc files from zenodo have to be placed in the respective folders in this repository under 'results/raw/' (see usage).
+
+For some supplementary plots the required data is not available on zenodo and will be made available on reasonable request.
 
 To implement photocatalysis in the optimization model the technology was added in [PyPSA-Eur](https://github.com/pypsa/pypsa-eur) and [atlite](https://github.com/pypsa/atlite). For this two forks of the software were created to directly show the changes while keeping the original history:
 
@@ -56,6 +58,8 @@ Once you have done all this you may run the `plots.py` script to recreate all pl
 mamba activate pypsa-pc-plots
 python plots.py
 ```
+
+For plotting Latex is used in the backend, thus if you don't have the required libraries installed you should comment out the line `mpl.rcParams.update(pgf_with_latex)` in `plots.py`and `supp_plots.ipynb`.
 
 ## Contributions
 

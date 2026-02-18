@@ -102,6 +102,9 @@ def extract_buses_for_technology(technology, case):
             for file_name in bus_files
             if "noUGHS" not in file_name
             and "efficiency" not in file_name
+            and "CCS" not in file_name
+            and "vopt" not in file_name
+            and "wind" not in file_name
             and not "_net_zero" in file_name
         ]
     elif case == "aghs":
@@ -110,6 +113,9 @@ def extract_buses_for_technology(technology, case):
             for file_name in bus_files
             if "noUGHS" in file_name
             and "efficiency" not in file_name
+            and "CCS" not in file_name
+            and "vopt" not in file_name
+            and "wind" not in file_name
             and not "_net_zero" in file_name
         ]
 
