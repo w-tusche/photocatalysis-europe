@@ -17,6 +17,20 @@ tech_colors:
     H2 pipeline (total): "#b3f3f4"
     H2 pipeline (repurposed): "#499a9c"
 
+# Carbon flow Sankey of the annex (supplementary_analysis.carbon_sankey)
+carbon_sankey:
+  combustion: "#B4693F"      # fuels burnt, releasing CO2 to the atmosphere
+  fossil source: "#874037"   # coal, industrial gas and process sources
+  atmosphere: "#74BBCD"
+  direct air capture: "#4F88B9"
+  biomass: "#6E9E4C"
+  pool: "#733957"            # the common pool of captured CO2
+  synthesis: "#C3A34B"       # Fischer-Tropsch and methanol synthesis
+  sequestration: "#4A4A4A"
+  net emissions: "#B03A2E"
+  process: "#8E6C99"  # non-combustion industrial process emissions
+  products: "#7F7F7F" # carbon that stays in industrial products, never burnt
+
 others:
   node density: "#D6D893"
   land area density: "#733957"
@@ -24,7 +38,6 @@ others:
   annualized costs: "#9D892B"
   pc-50: "#D29343"
   pc-0: "#FACCFA"
-  difference: "#FACCFA"
   h2_storage: "blue"
   no_UGHS_line: "#F8A17B"
   UGHS_line: "#011959" # and market share

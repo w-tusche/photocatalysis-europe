@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 # SPDX-FileCopyrightText: : 2020-2024 The PyPSA-Eur Authors
+# SPDX-FileCopyrightText: 2025 Wolfram Tuschewitzki, Jelto Lange
 #
 # SPDX-License-Identifier: MIT
-
-# TODO: clean this up. Contains lots of duplicated code from plot hydrogen network
 """
-...
+Collects the bus sizes / pipeline widths of the optimised hydrogen network so
+that `plots.py` and the supplementary notebooks can draw the maps from them.
 """
 
 import logging
@@ -13,18 +13,19 @@ import os
 
 import cartopy.crs as ccrs
 import geopandas as gpd
-import matplotlib.pyplot as plt
-import networkx as nx
-import numpy as np
 import pandas as pd
 import pypsa
 
-try:
-    import create_basic_summary as cbs
-except:
-    import src.create_basic_summary as cbs
+from create_basic_summary import REPO_ROOT, scenario_folders
 
 logger = logging.getLogger(__name__)
+
+# Defaults are anchored to the repository, not to the current working directory,
+# so the script and its functions work no matter where they are called from.
+DEFAULT_BUS_SIZES_FOLDER = os.path.join(REPO_ROOT, "data", "bus_sizes")
+DEFAULT_REGIONS_PATH = os.path.join(
+    REPO_ROOT, "data", "regions_onshore_elec_s_150.geojson"
+)
 
 
 def assign_location(n):
@@ -32,33 +33,11 @@ def assign_location(n):
         ifind = pd.Series(c.df.index.str.find(" ", start=4), c.df.index)
         for i in ifind.value_counts().index:
             # these have already been assigned defaults
-            if i == -2:
+            # (str.find returns -1 when it does not find a space)
+            if i == -1:
                 continue
             names = ifind.index[ifind == i]
             c.df.loc[names, "location"] = names.str[:i]
-
-
-def group_pipes(df, drop_direction=False):
-    """
-    Group pipes which connect same buses and return overall capacity.
-    """
-    df = df.copy()
-    if drop_direction:
-        positive_order = df.bus0 < df.bus2
-        df_p = df[positive_order]
-        swap_buses = {"bus0": "bus1", "bus1": "bus0"}
-        df_n = df[~positive_order].rename(columns=swap_buses)
-        df = pd.concat([df_p, df_n])
-
-    # there are pipes for each investment period rename to AC buses name for plotting
-    df["index_orig"] = df.index
-    df.index = df.apply(
-        lambda x: f"H2 pipeline {x.bus0.replace(' H2', '')} -> {x.bus1.replace(' H2', '')}",
-        axis=1,
-    )
-    return df.groupby(level=0).agg(
-        {"p_nom_opt": "sum", "bus0": "first", "bus1": "first", "index_orig": "first"}
-    )
 
 
 def collect_bus_sizes(network, regions, projection):
@@ -112,9 +91,6 @@ def collect_bus_sizes(network, regions, projection):
 
     bus_sizes_comb.rename(index=lambda x: x.replace(" H2", ""), level=0, inplace=True)
     bus_sizes = bus_sizes_comb
-
-    # # make a fake MultiIndex so that area is correct for legend
-    # bus_sizes.rename(index=lambda x: x.replace(" H2", ""), level=0, inplace=True)
 
     # drop all links which are not H2 pipelines
     n.links.drop(
@@ -181,17 +157,72 @@ def collect_bus_sizes(network, regions, projection):
     )
 
 
-def extract_bus_info(
-    results_folder: str, output_folder: str, re_create_files: bool
-) -> pd.DataFrame:
+def bus_size_writer(output_folder: str = None, regions_path: str = None):
     """
-    Function for assessing PyPSA-Eur results (i.e., .nc-files) and writing the
-    results to a .csv-file.
+    Function that writes the bus sizes of one loaded network.
+
+    The returned function is called as `write(n, scenario)` and writes
+    `bus_sizes_<scenario>.csv` into `output_folder`. A caller that has the
+    network open already (e.g. `create_summary_csv`) can write the file
+    without reading the network a second time.
 
     Parameters
     ----------
-    results_folder : str
-        Relative path to the sub-directories containing the .nc-files (in /raw)
+    output_folder : str, optional
+        Defaults to the repository's `data/bus_sizes/`, created if missing.
+    regions_path : str, optional
+        Path to the onshore regions GeoJSON. Defaults to the repository's
+        `data/regions_onshore_elec_s_150.geojson`.
+    """
+    if output_folder is None:
+        output_folder = DEFAULT_BUS_SIZES_FOLDER
+    if regions_path is None:
+        regions_path = DEFAULT_REGIONS_PATH
+
+    regions = gpd.read_file(regions_path).set_index("name")
+    proj = ccrs.EqualEarth()
+    os.makedirs(output_folder, exist_ok=True)
+
+    def write(n, scenario):
+        # the remaining return values (regions, link widths, scaling factors,
+        # network) are only needed for plotting, see plots.py
+        _, bus_sizes, *_ = collect_bus_sizes(n, regions, proj)
+
+        # For now save to csv only the bus_size information.
+        path = os.path.join(output_folder, f"bus_sizes_{scenario}.csv")
+        bus_sizes.to_csv(path)
+        print(f"Created new file:{path}")
+
+    return write
+
+
+def extract_bus_info(
+    output_folder: str = None,
+    re_create_files: bool = False,
+    raw_folder: str = None,
+    only_subfolders: list = None,
+    regions_path: str = None,
+) -> pd.DataFrame:
+    """
+    Function for assessing PyPSA-Eur results (i.e., .nc-files) and writing the
+    bus sizes to .csv-files. The networks can be read from another folder.
+
+    Parameters
+    ----------
+    output_folder : str, optional
+        Folder the `bus_sizes_<scenario>.csv` files are written to. Defaults to
+        the repository's `data/bus_sizes/` and is created if missing.
+    re_create_files : bool, optional
+        If True, rewrite bus-size files that already exist in `output_folder`.
+    raw_folder : str, optional
+        Folder containing the per-scenario subfolders with the .nc-files.
+        Defaults to data/raw/; scenarios named in `only_subfolders` are then
+        also looked up in `cases.EXTRA_RAW_FOLDERS`.
+    only_subfolders : list, optional
+        Process only these scenario subfolders.
+    regions_path : str, optional
+        Path to the onshore regions GeoJSON. Defaults to the repository's
+        `data/regions_onshore_elec_s_150.geojson`.
 
     Returns
     -------
@@ -203,25 +234,17 @@ def extract_bus_info(
     Exception
         If a sub-directory contains more than one .nc-file, an exception is raised.
     """
+    if output_folder is None:
+        output_folder = DEFAULT_BUS_SIZES_FOLDER
 
-    # relative file import!
-    regions = gpd.read_file(r".\data\regions_onshore_elec_s_150.geojson").set_index(
-        "name"
-    )
+    write = bus_size_writer(output_folder, regions_path)
 
-    proj = ccrs.EqualEarth()
+    folders = scenario_folders(raw_folder, only_subfolders)
 
-    raw_files_folder = os.path.join(results_folder, "raw/")
-    subfolder_list = next(os.walk(raw_files_folder))[1]
+    existing_files = os.listdir(output_folder)
+    print(f"Writing to {output_folder}.")
 
-    try:
-        existing_files = os.listdir(output_folder)
-        print("Reading existing files.")
-    except:
-        existing_files = []
-        print("No files exist, creating new files.")
-
-    for i, subfolder in enumerate(subfolder_list):
+    for subfolder, folder in folders.items():
         output_filename = f"bus_sizes_{subfolder}.csv"
 
         if output_filename in existing_files and re_create_files == False:
@@ -231,57 +254,44 @@ def extract_bus_info(
             continue
 
         # find all .nc-files within the subfolder (should be only one)
-        pypsa_files = [
-            file
-            for file in os.listdir(os.path.join(raw_files_folder, subfolder))
-            if file.endswith(".nc")
-        ]
+        pypsa_files = [file for file in os.listdir(folder) if file.endswith(".nc")]
 
         # more than one .nc-file in the same subfolder raises an exception
         if len(pypsa_files) > 1:
             raise Exception(
                 "More than one .nc-file in the subdirectory. "
-                + f"Please check data in {os.path.join(raw_files_folder, subfolder)}"
+                + f"Please check data in {folder}"
             )
 
         # import the PyPSA-Eur results
         try:
-            n = pypsa.Network(os.path.join(raw_files_folder, subfolder, pypsa_files[0]))
+            print(
+                f"Importing the following file: {os.path.join(folder, pypsa_files[0])}"
+            )
+            n = pypsa.Network(os.path.join(folder, pypsa_files[0]))
         except IndexError as e:
             print(
                 "Warning! There is no .nc-file in the subdirectory. Directory is skipped."
-                + f"Please check data in {os.path.join(raw_files_folder, subfolder)}"
+                + f"Please check data in {folder}"
                 + f"Error: {e}"
             )
             continue
 
-        (
-            regions,
-            bus_sizes,
-            link_widths_total,
-            link_widths_retro,
-            bus_size_factor,
-            linewidth_factor,
-            new_network,
-        ) = collect_bus_sizes(n, regions, proj)
-
-        # For now save to csv only the bus_size information.
-        bus_sizes.to_csv(
-            os.path.join(
-                output_folder,
-                output_filename,
-            )
-        )
-        print(f"Created new file:{os.path.join(output_folder,output_filename)}")
-
-
-def main():
-    # This should be the folder where you place all the raw results
-    results_folder = "./results/"
-    output_folder = r".\data\bus_sizes"
-    re_create_files = True
-    extract_bus_info(results_folder, output_folder, re_create_files)
+        write(n, subfolder)
 
 
 if __name__ == "__main__":
-    main()
+    # Options, see extract_bus_info()
+    raw_folder = None  # default data/raw/, see cases.py
+    output_folder = DEFAULT_BUS_SIZES_FOLDER
+    regions_path = DEFAULT_REGIONS_PATH
+    only_subfolders = None  # e.g. ["150_lv1.25_I_H_2045_PC_660Euro"]
+    re_create_files = False
+
+    extract_bus_info(
+        output_folder=output_folder,
+        re_create_files=re_create_files,
+        raw_folder=raw_folder,
+        only_subfolders=only_subfolders,
+        regions_path=regions_path,
+    )

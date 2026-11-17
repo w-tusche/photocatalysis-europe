@@ -1,39 +1,60 @@
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: 2025 Wolfram Tuschewitzki, Jelto Lange
+#
+# SPDX-License-Identifier: MIT
 import os
 import re
 
-import cartopy.crs as ccrs
 import geopandas as gpd
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import yaml
+from scipy.stats import gaussian_kde
 from shapely.geometry import box
 
-from scatter_plots import get_base_index
+from create_basic_summary import get_base_index, load_df_without_unit_row
 
-# --- Global paths and constants ---
-DATA_DIR = r"./data/generation_data"
-BUS_LOCATIONS_PATH = r"./data/bus_locations.csv"
-REGIONS_GEOJSON_PATH = r"./data/regions_onshore_elec_s_150.geojson"
-SUMMARY_PATH = r"./results/total_summary.csv"
-COLOR_DEFINITION_PATH = r"./src/colors.yaml"
-SKIP_KEYWORDS = ["6pct", "3pct", "900", "925", "_net_zero", "_vopt", "_CCS", "_wind"]
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+DATA_DIR = os.path.join(REPO_ROOT, "data", "generation_data")
+BUS_LOCATIONS_PATH = os.path.join(REPO_ROOT, "data", "bus_locations.csv")
+REGIONS_GEOJSON_PATH = os.path.join(
+    REPO_ROOT, "data", "regions_onshore_elec_s_150.geojson"
+)
+SUMMARY_PATH = os.path.join(REPO_ROOT, "results", "total_summary.csv")
+COLOR_DEFINITION_PATH = os.path.join(REPO_ROOT, "src", "colors.yaml")
+# MWh of hydrogen per repeated row, seaborn's violinplot has no weights.
+# Nodes below SCALING/2 (2 GWh/a) get no row.
+SCALING = 4e3
+
+# The figure leaves out the 950 (PC-0) and 925 EUR/kW cost points
+SKIP_KEYWORDS = [
+    "6pct",
+    "3pct",
+    "925",
+    "950",
+    "_net_zero",
+    "_vopt",
+    "_CCS",
+    "_wind",
+    "_transport",
+    "_elheat0",
+]
 
 
 # --- Helper functions ---
-def filter_filename(filename):
+def filter_filename(filename, skip_keywords=None):
     """
-    Returns False if filename contains any keyword in SKIP_KEYWORDS, True
-    otherwise.
+    Returns False if filename is not a generation file
+    (generation_<scenario>.csv) or contains any keyword in skip_keywords
+    (defaults to SKIP_KEYWORDS), True otherwise.
 
     Logs skipped filenames.
     """
-    if any(keyword in filename for keyword in SKIP_KEYWORDS):
-        print(
-            f"File '{filename}' skipped (contains keywords: {', '.join(SKIP_KEYWORDS)})"
-        )
+    if not (filename.startswith("generation_") and filename.endswith(".csv")):
+        return False
+    keywords = SKIP_KEYWORDS if skip_keywords is None else skip_keywords
+    if any(keyword in filename for keyword in keywords):
+        print(f"File '{filename}' skipped (contains keywords: {', '.join(keywords)})")
         return False
     return True
 
@@ -182,6 +203,124 @@ def process_files(filtered_files, scaling, direction, case="split"):
     return demand_df, generation_df
 
 
+def load_capex_annualized_cost_map(total_summary_df):
+    """
+    Map the capex token of a scenario folder name to its annualized
+    photocatalysis cost.
+
+    Args:
+        total_summary_df (pd.DataFrame): summary DataFrame.
+
+    Returns:
+        dict: capex token (e.g. "660") -> annualized cost.
+    """
+    return {
+        re.findall(r"\d+(?=Euro)", idx)[0]: round(float(val), 1)
+        for idx, val in total_summary_df.loc[
+            [
+                i
+                for i in list(total_summary_df.index)
+                # drops scenarios without "<n>Euro" in the name
+                if "pct_efficiency" not in i
+                and "_noUGHS" not in i
+                and "Unit" not in i
+                and re.findall(r"\d+(?=Euro)", i)
+            ],
+            :,
+        ]["pc total annual cost"].items()
+    }
+
+
+def prepare_swarm_data(
+    capex_annualized_cost_map, direction="vertical", skip_keywords=None
+):
+    """
+    One row per (scenario, node, series) for the beeswarm overlay, with the
+    number of rows the node has in the violin. Nodes without a row are dropped.
+
+    Args:
+        capex_annualized_cost_map (dict): capex token -> annualized cost.
+        direction (str): 'vertical' or 'horizontal'.
+        skip_keywords (list[str], optional): passed on to filter_filename,
+            defaults to SKIP_KEYWORDS.
+
+    Returns:
+        pd.DataFrame: columns Bus, latitude/longitude, value_MWh, n_rows,
+        "PC capex", series.
+    """
+    series_columns = {
+        "Electrolysis": "h2_generation_Electrolysis_MWh",
+        "Photocatalysis": "h2_generation_Photocatalysis_MWh",
+        "Demand": "total_h2_demand_MWh",
+    }
+    coordinate = "latitude" if direction == "vertical" else "longitude"
+    bus_locations = load_bus_locations(direction)
+
+    frames = []
+    for filename in [
+        f for f in os.listdir(DATA_DIR) if filter_filename(f, skip_keywords)
+    ]:
+        if categorize_filename(filename) != "UGHS":
+            continue
+        pc_capex = extract_pc_capex(filename)
+        df_base = pd.read_csv(os.path.join(DATA_DIR, filename), index_col=0)
+
+        for label, column in series_columns.items():
+            values = df_base[column]
+            frames.append(
+                pd.DataFrame(
+                    {
+                        coordinate: bus_locations[coordinate],
+                        "value_MWh": values,
+                        "n_rows": (values / SCALING).round(),
+                        "PC capex": float(capex_annualized_cost_map[pc_capex]),
+                        "series": label,
+                    }
+                )
+            )
+
+    swarm_df = pd.concat(frames).reset_index(names="Bus")
+    return swarm_df[swarm_df["n_rows"] >= 1].reset_index(drop=True)
+
+
+def volume_profiles(swarm_df, grid, bandwidth, coordinate="latitude"):
+    """
+    Hydrogen volume per degree of `coordinate` for every (scenario, series).
+
+    Weighted Gaussian KDE (scipy's gaussian_kde, weights = volume of each
+    node) with a fixed kernel standard deviation of `bandwidth` degrees,
+    multiplied by the total volume of the series. The result integrates to
+    that volume instead of 1, so all series share one unit (TWh/a per degree)
+    and can be added up for the stacked violins.
+
+    Args:
+        swarm_df (pd.DataFrame): one row per node, as prepare_swarm_data()
+            returns it (needs `coordinate`, "n_rows", "PC capex", "series").
+        grid (np.ndarray): coordinate values to evaluate the density on.
+        bandwidth (float): kernel bandwidth in degrees, common to all series.
+        coordinate (str): "latitude" or "longitude".
+
+    Returns:
+        dict[tuple[float, str], np.ndarray]: (scenario, series) -> TWh per
+        degree on `grid`.
+    """
+    twh_per_row = SCALING / 1e6
+    profiles = {}
+    for (scenario, series), group in swarm_df.groupby(["PC capex", "series"]):
+        coordinates = group[coordinate].to_numpy()
+        weights = group["n_rows"].to_numpy() * twh_per_row
+        # scipy's bw_method is a factor on the weighted standard deviation of
+        # the data; dividing by that std fixes the kernel std at `bandwidth`
+        # degrees for every series (np.cov as gaussian_kde computes it)
+        weighted_std = np.sqrt(np.cov(coordinates, aweights=weights))
+        kde = gaussian_kde(
+            coordinates, weights=weights, bw_method=bandwidth / weighted_std
+        )
+        # gaussian_kde integrates to 1; times the total volume gives TWh/a per degree
+        profiles[(scenario, series)] = kde(grid) * weights.sum()
+    return profiles
+
+
 def get_density_data(
     orientation,
     bus_locations_path=BUS_LOCATIONS_PATH,
@@ -320,54 +459,86 @@ def apply_rename_and_convert(df, column_name, rename_map):
     return df
 
 
-def prepare_all_data():
+def node_counts_per_violin(
+    direction="vertical", market_share_map=None, all_cost_points=False
+):
+    """
+    Number of nodes each violin of the generation/demand figure is built from,
+    i.e. the nodes with at least one row.
+
+    Args:
+        direction (str): 'vertical' or 'horizontal'.
+        market_share_map (dict, optional): annualized cost (as str) -> market
+            share
+        all_cost_points (bool): include the 950 and 925 Euro cost points
+
+    Returns:
+        pd.DataFrame: one row per scenario, columns Electrolysis,
+        Photocatalysis, Demand and Total nodes.
+    """
+    skip_keywords = (
+        [k for k in SKIP_KEYWORDS if k not in ("925", "950")]
+        if all_cost_points
+        else None
+    )
+    total_summary_df = load_df_without_unit_row(SUMMARY_PATH)
+    swarm_df = prepare_swarm_data(
+        load_capex_annualized_cost_map(total_summary_df), direction, skip_keywords
+    )
+
+    counts = (
+        swarm_df.groupby(["PC capex", "series"])
+        .size()
+        .unstack("series")
+        # PC-0 has no photocatalysis node
+        .reindex(columns=["Electrolysis", "Photocatalysis", "Demand"], fill_value=0)
+        .fillna(0)
+        .astype(int)
+        .rename_axis(columns=None)
+    )
+    counts["Total nodes"] = len(load_bus_locations(direction))
+
+    if market_share_map is not None:
+        counts.insert(0, "Annualized cost", counts.index)
+        counts.index = [
+            float(market_share_map.get(str(cost), cost)) for cost in counts.index
+        ]
+        counts.index.name = "Market share"
+    return counts.sort_index()
+
+
+def prepare_data(direction="vertical"):
+    """
+    Build the violin input for one direction only.
+
+    `direction="vertical"` bins the nodes by latitude, `"horizontal"` by
+    longitude.
+
+    Args:
+        direction (str): 'vertical' or 'horizontal'.
+
+    Returns:
+        tuple: (total_summary_df, generation_violin_split_df, demand_violin_df,
+        node_density_and_land_density, capex_annualized_cost_map, base_index,
+        colors_dict)
+    """
     filtered_files = [f for f in os.listdir(DATA_DIR) if filter_filename(f)]
 
-    # Process all files once and get both dataframes
-    demand_violin_df_vertical, generation_violin_split_df_vertical = process_files(
-        filtered_files, scaling=1e4, direction="vertical", case="split"
+    demand_violin_df, generation_violin_split_df = process_files(
+        filtered_files, scaling=SCALING, direction=direction, case="split"
     )
-    node_density_and_land_density_vertical = pd.concat(
-        get_density_data("vertical"), axis=0
-    )
-
-    demand_violin_df_horizontal, generation_violin_split_df_horizontal = process_files(
-        filtered_files, scaling=1e4, direction="horizontal", case="split"
-    )
-    node_density_and_land_density_horizontal = pd.concat(
-        get_density_data("horizontal"), axis=0
-    )
+    node_density_and_land_density = pd.concat(get_density_data(direction), axis=0)
 
     # Create annualized photocatalysis mapping depending on the pc_capex stored in the index
-    total_summary_df = pd.read_csv(
-        SUMMARY_PATH, index_col=0, header=0, skiprows=range(1, 2)
-    )
-    capex_annualized_cost_map = {
-        re.findall(r"\d+(?=Euro)", idx)[0]: round(float(val), 1)
-        for idx, val in total_summary_df.loc[
-            [
-                i
-                for i in list(total_summary_df.index)
-                if "pct_efficiency" not in i and "_noUGHS" not in i and "Unit" not in i
-            ],
-            :,
-        ]["pc total annual cost"].items()
-    }
+    total_summary_df = load_df_without_unit_row(SUMMARY_PATH)
+    capex_annualized_cost_map = load_capex_annualized_cost_map(total_summary_df)
 
-    generation_violin_split_df_vertical = apply_rename_and_convert(
-        generation_violin_split_df_vertical, "PC capex", capex_annualized_cost_map
+    generation_violin_split_df = apply_rename_and_convert(
+        generation_violin_split_df, "PC capex", capex_annualized_cost_map
     )
 
-    demand_violin_df_vertical = apply_rename_and_convert(
-        demand_violin_df_vertical, "PC capex", capex_annualized_cost_map
-    )
-
-    generation_violin_split_df_horizontal = apply_rename_and_convert(
-        generation_violin_split_df_horizontal, "PC capex", capex_annualized_cost_map
-    )
-
-    demand_violin_df_horizontal = apply_rename_and_convert(
-        demand_violin_df_horizontal, "PC capex", capex_annualized_cost_map
+    demand_violin_df = apply_rename_and_convert(
+        demand_violin_df, "PC capex", capex_annualized_cost_map
     )
 
     base_index, *_ = get_base_index(total_summary_df)
@@ -377,626 +548,10 @@ def prepare_all_data():
 
     return (
         total_summary_df,
-        generation_violin_split_df_vertical,
-        demand_violin_df_vertical,
-        node_density_and_land_density_vertical,
-        generation_violin_split_df_horizontal,
-        demand_violin_df_horizontal,
-        node_density_and_land_density_horizontal,
+        generation_violin_split_df,
+        demand_violin_df,
+        node_density_and_land_density,
+        capex_annualized_cost_map,
         base_index,
         colors_dict,
     )
-
-
-def plot_hydrogen_generation_and_demand_violins_vertical(
-    total_summary_df,
-    generation_violin_split_df_vertical,
-    demand_violin_df_vertical,
-    node_density_and_land_density_vertical,
-    base_index,
-    colors_dict,
-):
-    background_map = True
-    violin_width = 1
-
-    fig, (ax1, ax2) = plt.subplots(
-        nrows=1, ncols=2, figsize=(12, 6), width_ratios=[0.75, 0.25]
-    )
-
-    # Violin for Electrolysis H2 generation (aim to have it on the left side)
-    sns.violinplot(
-        data=generation_violin_split_df_vertical[
-            (generation_violin_split_df_vertical["case"] == "Electrolysis")
-            & (generation_violin_split_df_vertical["ughs_state"] == "UGHS")
-        ],
-        x="PC capex",
-        y="latitude",
-        # Create only left side
-        hue=True,
-        hue_order=[False, True],
-        split=True,
-        palette=[colors_dict["tech_colors"]["H2 Electrolysis"]] * 2,
-        dodge=True,
-        orient="v",
-        inner="quart",  # quartiles of the data
-        bw_method="silverman",
-        density_norm="count",
-        common_norm=True,
-        fill=True,
-        ax=ax1,
-        label=r"Hydrogen generation by electrolysis",
-        legend=False,
-        native_scale=True,
-        width=violin_width,
-        zorder=-3,
-    )
-
-    # Violin for Photocatalysis H2 generation (aim to have it on the left side)
-    sns.violinplot(
-        data=generation_violin_split_df_vertical[
-            (generation_violin_split_df_vertical["case"] == "Photocatalysis")
-            & (generation_violin_split_df_vertical["ughs_state"] == "UGHS")
-        ],
-        x="PC capex",
-        y="latitude",
-        # Create only left side
-        hue=True,
-        hue_order=[False, True],
-        split=True,
-        palette=[colors_dict["tech_colors"]["photocatalysis"]] * 2,
-        dodge=True,
-        orient="v",
-        inner="quart",  # quartiles of the data
-        density_norm="count",
-        bw_method="silverman",
-        common_norm=True,
-        fill=True,
-        ax=ax1,
-        label=r"Hydrogen generation by photocatalysis",
-        legend=False,
-        native_scale=True,
-        width=violin_width,
-        zorder=-2,
-    )
-
-    ax1.set_xlim([115, 163])
-    ax1_pos = ax1.get_position()
-    ax1_2 = fig.add_axes(
-        [ax1_pos.x0 + 0.0127, ax1_pos.y0, ax1_pos.width, ax1_pos.height], frame_on=False
-    )
-    sns.violinplot(
-        data=demand_violin_df_vertical[(demand_violin_df_vertical["case"] == "UGHS")],
-        x="PC capex",
-        y="latitude",
-        hue=True,
-        hue_order=[True, False],
-        palette=[colors_dict["tech_colors"]["hydrogen"]] * 2,
-        split=True,  # Does not work as expected!
-        orient="v",
-        inner="quart",  # quartiles of the data
-        bw_method="silverman",
-        gap=0.5,
-        density_norm="count",
-        common_norm=True,
-        fill=True,
-        legend=False,
-        ax=ax1_2,
-        label=r"Hydrogen demand",
-        native_scale=True,
-        width=violin_width,
-        zorder=-1,
-    )
-
-    ax1_2.axis(False)
-
-    #  Add description for PC-50 case
-    ax1.annotate(
-        "PC-50",
-        xy=(118.4, 69.5),  # Arrow target position (on x-axis)
-        xytext=(118.4, 1.05),  # Text position (above x-axis)
-        textcoords=("data", "axes fraction"),  # Mix of data and fraction coords
-        arrowprops=dict(arrowstyle="-", facecolor="black", linewidth=2),
-        ha="center",
-    )
-
-    # --- Add market share line
-    ax1_y2 = ax1.twinx()
-
-    ax1_y2.plot(
-        total_summary_df.loc[base_index, "pc total annual cost"],
-        total_summary_df.loc[base_index, "pc market share"],
-        ls="--",
-        marker="s",
-        c=colors_dict["others"]["UGHS_line"],
-        alpha=0.7,
-        label="Market share",
-    )
-
-    ax1_y2.set_ylim([0, 55])
-    ax1_y2.set_ylabel("Photocatalysis market share in %", fontsize=15)
-    ax1_y2.tick_params(
-        labelsize=13,
-    )
-    # --- Add market share line
-
-    #### Create plot to the right with node density and land area density
-    sns.violinplot(
-        data=node_density_and_land_density_vertical,
-        x="x",
-        y="Latitude",
-        hue="hue",
-        palette=[
-            colors_dict["others"]["node density"],
-            colors_dict["others"]["land area density"],
-        ],
-        split=True,
-        orient="v",
-        inner="quart",  # quartiles of the data
-        density_norm="count",
-        bw_method="silverman",
-        fill=True,
-        ax=ax2,
-        zorder=-2,
-    )
-
-    # Add descriptive annotations with arrows
-    df_for_description = node_density_and_land_density_vertical[
-        node_density_and_land_density_vertical["hue"] == "Node density"
-    ]["Latitude"]
-    q1 = df_for_description.quantile(0.25)
-    median = df_for_description.median()
-    q3 = df_for_description.quantile(0.75)
-
-    ax2.annotate(
-        "Quartile 1",
-        xy=(-0.1, q1),
-        xytext=(-0.45, 37),
-        arrowprops=dict(arrowstyle="->", lw=1.5),
-    )
-    ax2.annotate(
-        "Median",
-        xy=(-0.2, median),
-        xytext=(-0.49, 42),
-        arrowprops=dict(arrowstyle="->", lw=1.5),
-    )
-    ax2.annotate(
-        "Quartile 3",
-        xy=(-0.08, q3),
-        xytext=(-0.49, 57),
-        arrowprops=dict(arrowstyle="->", lw=1.5),
-    )
-    ax2.annotate(
-        "Kernel\ndensity",
-        xy=(-0.065, 60),
-        xytext=(-0.45, 62),
-        arrowprops=dict(arrowstyle="->", lw=1.5),
-    )
-
-    ax1.set_xlabel(
-        r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$", fontsize=15
-    )
-    ax1.set_ylabel("Latitude in °N", fontsize=15)
-    ax2.set_ylabel("Latitude in °N", fontsize=15)
-    ax2.set_xlabel("PyPSA-Eur 150 nodes", fontsize=15)
-
-    # Gather handles and labels from both axes
-    handles, labels = ax1.get_legend_handles_labels()  # Supply EL & PC
-    handles2, labels2 = ax1_2.get_legend_handles_labels()  # H2 Demand
-    handles3, labels3 = ax1_y2.get_legend_handles_labels()  # Market share
-
-    # Combine and deduplicate
-    unique_labels = dict(zip(labels + labels2 + labels3, handles + handles2 + handles3))
-
-    ax1.set_ylim([35, 70])
-    ax1_2.set_ylim([35, 70])
-    ax2.set_ylim([35, 70])
-    # ax1_2.set_xlim(ax1.get_xlim())
-    # TODO: When changing aspect ratio or distance between subplots the first value here has to be adjusted to correctly show the demand violins
-    ax1_2.set_xlim((112.9, 163.0))
-
-    # Create the legend below the plot
-    ax1.legend(
-        unique_labels.values(),
-        unique_labels.keys(),
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.12),
-        ncol=2,
-        frameon=False,
-        fontsize=14,
-    )
-    sns.move_legend(
-        ax2,
-        "upper center",
-        bbox_to_anchor=(0.5, -0.12),
-        ncol=1,
-        title=None,
-        frameon=False,
-        fontsize=14,
-    )
-
-    ax1.grid(alpha=0.3, zorder=20)
-    ax2.grid(alpha=0.3, zorder=20)
-    ax1_2.yaxis.grid(True, alpha=0.3, zorder=20)
-
-    # Redraw lines on top to have a grid also on the green violins
-    gridlines = ax1.yaxis.get_gridlines()
-    gridline_color = gridlines[0].get_color()
-    gridline_linestyle = gridlines[0].get_linestyle()
-    gridline_linewidth = gridlines[0].get_linewidth()
-
-    for y in ax1.get_yticks():  # Adjust range and step based on your y-axis limits
-        ax1_2.axhline(
-            y=y,
-            color=gridline_color,
-            xmin=0,
-            xmax=0.95,
-            linestyle=gridline_linestyle,
-            linewidth=gridline_linewidth,
-            zorder=10,
-            alpha=0.3,
-        )
-
-    ax1.invert_xaxis()
-    ax1_2.invert_xaxis()
-
-    ax1.tick_params(
-        axis="both",
-        direction="in",
-        bottom=True,
-        top=True,
-        left=True,
-        right=True,
-        labelsize=13,
-    )
-    ax2.tick_params(
-        axis="both",
-        direction="in",
-        bottom=True,
-        top=True,
-        left=True,
-        right=True,
-        labelsize=13,
-    )
-
-    # TODO: When changing this the first value in ax1_2.set_xlim() has to be changed!
-    plt.subplots_adjust(wspace=0.3)
-
-    if background_map:
-        proj_kwargs = {"name": "EqualEarth"}
-
-        proj_func = getattr(ccrs, proj_kwargs.pop("name"))
-        proj = proj_func(**proj_kwargs)
-
-        regions = gpd.read_file(REGIONS_GEOJSON_PATH).set_index("name")
-        regions = regions.to_crs(proj.proj4_init)
-
-        ax1_map = fig.add_axes(
-            ax1_pos, projection=proj, zorder=-10
-        )  # Create overlay axes
-
-        # Plot the map onto the overlay axes
-        regions.plot(
-            ax=ax1_map, linewidth=1, color="lightgrey", edgecolor="white", alpha=0.4
-        )
-        ax1_map.set_extent([-9.5, 26.5, 35, 70])  # Set the extent of the map
-        ax1_map.axis("off")  # Turn off the axis to show only the map
-
-        # Adjust ax1 to be transparent or semi-transparent to show the map underneath
-        ax1.set_facecolor("none")  # Make the background of ax1
-
-    plt.show()
-
-
-def plot_hydrogen_generation_and_demand_violins_horizontal(
-    total_summary_df,
-    generation_violin_split_df_horizontal,
-    demand_violin_df_horizontal,
-    node_density_and_land_density_horizontal,
-    base_index,
-    colors_dict,
-):
-    background_map = True
-    violin_width = 1
-
-    fig, (ax1, ax2) = plt.subplots(
-        nrows=2, ncols=1, figsize=(8, 10), height_ratios=[0.75, 0.25]
-    )
-
-    # Violin for Electrolysis H2 generation (aim to have it on the left side)
-    sns.violinplot(
-        data=generation_violin_split_df_horizontal[
-            (generation_violin_split_df_horizontal["case"] == "Electrolysis")
-            & (generation_violin_split_df_horizontal["ughs_state"] == "UGHS")
-        ],
-        x="longitude",
-        y="PC capex",
-        # Create only left side
-        hue=True,
-        hue_order=[False, True],
-        split=True,
-        palette=[colors_dict["tech_colors"]["H2 Electrolysis"]] * 2,
-        dodge=True,
-        orient="h",
-        inner="quart",  # quartiles of the data
-        bw_method="silverman",
-        density_norm="count",
-        common_norm=True,
-        fill=True,
-        ax=ax1,
-        label=r"Hydrogen generation by electrolysis",
-        legend=False,
-        native_scale=True,
-        width=violin_width,
-        zorder=-3,
-        alpha=0.85,
-    )
-
-    # Violin for Photocatalysis H2 generation (aim to have it on the left side)
-    sns.violinplot(
-        data=generation_violin_split_df_horizontal[
-            (generation_violin_split_df_horizontal["case"] == "Photocatalysis")
-            & (generation_violin_split_df_horizontal["ughs_state"] == "UGHS")
-        ],
-        x="longitude",
-        y="PC capex",
-        # Create only left side
-        hue=True,
-        hue_order=[False, True],
-        split=True,
-        palette=[colors_dict["tech_colors"]["photocatalysis"]] * 2,
-        dodge=True,
-        orient="h",
-        inner="quart",  # quartiles of the data
-        density_norm="count",
-        bw_method="silverman",
-        common_norm=True,
-        fill=True,
-        ax=ax1,
-        label=r"Hydrogen generation by photocatalysis",
-        legend=False,
-        native_scale=True,
-        width=violin_width,
-        zorder=-2,
-        alpha=0.85,
-    )
-
-    ax1.set_ylim([115, 165])
-    ax1_pos = ax1.get_position()
-    ax1_2 = fig.add_axes(
-        [ax1_pos.x0, ax1_pos.y0, ax1_pos.width, ax1_pos.height], frame_on=False
-    )
-
-    x0, x1 = ax1.get_xlim()
-    ax1_2.set_xlim([x0, x1])
-    y0, y1 = ax1.get_ylim()
-    dy = 1.4
-    ax1_2.set_ylim([y0 + dy, y1 + dy])
-
-    sns.violinplot(
-        data=demand_violin_df_horizontal[
-            (demand_violin_df_horizontal["case"] == "UGHS")
-        ],
-        x="longitude",
-        y="PC capex",
-        hue=True,
-        hue_order=[True, False],
-        palette=[colors_dict["tech_colors"]["hydrogen"]] * 2,
-        split=True,  # Does not work as expected!
-        orient="h",
-        inner="quart",  # quartiles of the data
-        bw_method="silverman",
-        gap=0.5,
-        density_norm="count",
-        common_norm=True,
-        fill=True,
-        legend=False,
-        ax=ax1_2,
-        label=r"Hydrogen demand",
-        native_scale=True,
-        width=violin_width,
-        zorder=-1,
-        alpha=0.85,
-    )
-
-    ax1_2.axis(False)
-
-    #  Add description for PC-50 case
-    ax1.annotate(
-        "PC-50",
-        xy=(30, 118.4),  # Arrow target position (on x-axis)
-        xytext=(1.05, 117.9),  # Text position (above x-axis)
-        textcoords=("axes fraction", "data"),  # Mix of data and fraction coords
-        arrowprops=dict(arrowstyle="-", facecolor="black", linewidth=2),
-        ha="center",
-    )
-
-    # --- Add market share line
-    ax1_y2 = ax1.twiny()
-
-    ax1_y2.plot(
-        total_summary_df.loc[base_index, "pc market share"],
-        total_summary_df.loc[base_index, "pc total annual cost"],
-        ls="--",
-        marker="s",
-        c=colors_dict["others"]["UGHS_line"],
-        alpha=0.7,
-        label="Market share",
-    )
-
-    ax1_y2.set_xlim([0, 55])
-    ax1_y2.set_xlabel("Photocatalysis market share in %", fontsize=15)
-    ax1_y2.tick_params(
-        labelsize=13,
-    )
-    # --- Add market share line
-
-    #### Create plot to the right with node density and land area density
-    sns.violinplot(
-        data=node_density_and_land_density_horizontal,
-        x="longitude",
-        y="y",
-        hue="hue",
-        palette=[
-            colors_dict["others"]["node density"],
-            colors_dict["others"]["land area density"],
-        ],
-        split=True,
-        orient="h",
-        inner="quart",  # quartiles of the data
-        density_norm="count",
-        bw_method="silverman",
-        fill=True,
-        ax=ax2,
-        zorder=-2,
-    )
-
-    # Add descriptive annotations with arrows
-    df_for_description = node_density_and_land_density_horizontal[
-        node_density_and_land_density_horizontal["hue"] == "Node density"
-    ]["longitude"]
-    q1 = df_for_description.quantile(0.25)
-    median = df_for_description.median()
-    q3 = df_for_description.quantile(0.75)
-
-    ax1.set_ylabel(
-        r"Annualized photocatalysis cost in € a$^{-1}$ kW$^{-1}$", fontsize=15
-    )
-    ax1.set_xlabel("longitude in °N", fontsize=15)
-    ax2.set_xlabel("longitude in °N", fontsize=15)
-    ax2.set_ylabel("PyPSA-Eur\n150 nodes", fontsize=15)
-
-    # Gather handles and labels from both axes
-    handles, labels = ax1.get_legend_handles_labels()  # Supply EL & PC
-    handles2, labels2 = ax1_2.get_legend_handles_labels()  # H2 Demand
-    handles3, labels3 = ax1_y2.get_legend_handles_labels()  # Market share
-
-    # Combine and deduplicate
-    unique_labels = dict(zip(labels + labels2 + labels3, handles + handles2 + handles3))
-
-    # Create the legend below the plot
-    ax1.legend(
-        unique_labels.values(),
-        unique_labels.keys(),
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.65),
-        ncol=2,
-        frameon=False,
-        fontsize=14,
-    )
-    sns.move_legend(
-        ax2,
-        "upper center",
-        bbox_to_anchor=(0.5, -0.22),
-        ncol=1,
-        title=None,
-        frameon=False,
-        fontsize=14,
-    )
-
-    ax1.grid(alpha=0.3, zorder=20)
-    ax2.grid(alpha=0.3, zorder=20)
-    ax1_2.xaxis.grid(True, alpha=0.3, zorder=20)
-    # FIXME: turn off the grid!
-    ax1_2.yaxis.grid(False)
-    ax1_2.yaxis.grid("off")
-    ax2.set_xlim(ax1.get_xlim())
-
-    # Redraw lines on top to have a grid also on the green violins
-    gridlines = ax1.yaxis.get_gridlines()
-    gridline_color = gridlines[0].get_color()
-    gridline_linestyle = gridlines[0].get_linestyle()
-    gridline_linewidth = gridlines[0].get_linewidth()
-
-    for y in ax1.get_yticks():  # Adjust range and step based on your y-axis limits
-        ax1_2.axhline(
-            y=y,
-            color=gridline_color,
-            xmin=0,
-            xmax=0.95,
-            linestyle=gridline_linestyle,
-            linewidth=gridline_linewidth,
-            zorder=10,
-            alpha=0.3,
-        )
-
-    ax1.tick_params(
-        axis="both",
-        direction="in",
-        bottom=True,
-        top=True,
-        left=True,
-        right=True,
-        labelsize=13,
-    )
-    ax2.tick_params(
-        axis="both",
-        direction="in",
-        bottom=True,
-        top=True,
-        left=True,
-        right=True,
-        labelsize=13,
-    )
-
-    # plt.subplots_adjust(wspace=0.3)
-
-    if background_map:
-        proj_kwargs = {"name": "EqualEarth"}
-
-        proj_func = getattr(ccrs, proj_kwargs.pop("name"))
-        proj = proj_func(**proj_kwargs)
-
-        regions = gpd.read_file(REGIONS_GEOJSON_PATH).set_index("name")
-        regions = regions.to_crs(proj.proj4_init)
-
-        ax1_map = fig.add_axes(
-            ax1_pos, projection=proj, zorder=-10
-        )  # Create overlay axes
-
-        # Plot the map onto the overlay axes
-        regions.plot(
-            ax=ax1_map, linewidth=1, color="lightgrey", edgecolor="white", alpha=0.4
-        )
-        ax1_map.set_extent([-9.5, 26.5, 35, 70])  # Set the extent of the map
-        ax1_map.axis("off")  # Turn off the axis to show only the map
-
-        # Adjust ax1 to be transparent or semi-transparent to show the map underneath
-        ax1.set_facecolor("none")  # Make the background of ax1
-
-    plt.show()
-
-
-def main():
-    (
-        total_summary_df,
-        generation_violin_split_df_vertical,
-        demand_violin_df_vertical,
-        node_density_and_land_density_vertical,
-        generation_violin_split_df_horizontal,
-        demand_violin_df_horizontal,
-        node_density_and_land_density_horizontal,
-        base_index,
-        colors_dict,
-    ) = prepare_all_data()
-
-    plot_hydrogen_generation_and_demand_violins_vertical(
-        total_summary_df,
-        generation_violin_split_df_vertical,
-        demand_violin_df_vertical,
-        node_density_and_land_density_vertical,
-        base_index,
-        colors_dict,
-    )
-
-    plot_hydrogen_generation_and_demand_violins_horizontal(
-        total_summary_df,
-        generation_violin_split_df_horizontal,
-        demand_violin_df_horizontal,
-        node_density_and_land_density_horizontal,
-        base_index,
-        colors_dict,
-    )
-
-
-if __name__ == "__main__":
-    main()

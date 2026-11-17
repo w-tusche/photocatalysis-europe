@@ -37,9 +37,16 @@ ENV/
 env.bak/
 venv.bak/
 
-# ignore raw result nc files.
-results/raw/150_lv1.25_I_H_2045_3H_PC_650Euro/elec_s_150_lv1.25__I-H_2045.nc
-results/raw/150_lv1.25_I_H_2045_3H_PC_925Euro/elec_s_150_lv1.25__I-H_2045.nc
+# Solved networks and everything the scripts derive from them (README, "Folders").
+# The .gitkeep files keep the empty folders in the repository.
+data/raw/*
+data/generation_data/*
+data/bus_sizes/*
+data/balance_pairs/*
+data/system_cost_breakdown/*
+results/recomputed/*
+img/*
+!**/.gitkeep
 
 # Negate a rule
 !.gitignore

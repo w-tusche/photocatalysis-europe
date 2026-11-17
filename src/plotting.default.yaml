@@ -276,6 +276,23 @@ plotting:
     load: "Load Shedding"
     ac: "AC"
     dc: "DC"
+    urban central heat: "District heating (urban central)"
+    urban decentral heat: "Decentral heating, urban"
+    rural heat: "Decentral heating, rural"
+    low-temperature heat for industry: "Low-temperature heat for industry"
+    electricity: "Residential and services electricity"
+    industry electricity: "Industry electricity"
+    kerosene for aviation: "Kerosene for aviation"
+    naphtha for industry: "Naphtha for industry"
+    shipping oil: "Fuel oil for shipping"
+    shipping methanol: "Methanol for shipping"
+    industry methanol: "Methanol for industry"
+    H2 for industry: "Hydrogen for industry"
+    gas for industry: "Gas for industry"
+    coal for industry: "Coal for industry"
+    solid biomass for industry: "Solid biomass for industry"
+    land transport EV: "Land transport, electric"
+    land transport oil: "Land transport, oil"
 
   tech_colors:
     # wind
@@ -462,6 +479,7 @@ plotting:
     urban central heat dsm: '#d15959'
     urban central heat vent: '#a74747'
     decentral heat: '#750606'
+    urban decentral heat: '#a33c3c'  # added for this repo, the load carrier
     residential urban decentral heat: '#a33c3c'
     residential urban decentral heat dsm: '#a33c3c'
     services urban decentral heat: '#cc1f1f'

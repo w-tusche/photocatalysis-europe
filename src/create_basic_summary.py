@@ -1,45 +1,121 @@
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: 2025 Wolfram Tuschewitzki, Jelto Lange
+#
+# SPDX-License-Identifier: MIT
 """
-This scrip creates a basic summary of PyPSA-Eur .nc-files including
+This script creates a basic summary of PyPSA-Eur .nc-files including
 photocatalysis systems.
 
 The script runs through the subdirectories assessing .nc-files regarding system
 characteristics (e.g., installed power plant capacities, installed capacities of
 hydrogen storage systems) and stores the results in `total_summary.csv`.
 
-The following structure of the (sub)directories is required:
+The networks are read from one subfolder per scenario, each holding one .nc
+file; where these subfolders are searched is defined in cases.py:
 
 .
-├── create_basic_summary.py
+├── data
+│   └── raw
+│       ├── <scenario_1>
+│       │   └── pypsa_result.nc
+│       ...
+│       └── <scenario_n>
+│           └── pypsa_result.nc
 └── results
-    └── raw
-        ├── folder_containing_nc_file_1
-        │   ...
-        │   └── pypsa_result.nc
-        ├── folder_containing_nc_file_2
-        │   ...
-        │   └── pypsa_result.nc
-        ...
-        ├── folder_containing_nc_file_n
-        │   ...
-        │   └── pypsa_result.nc
-        └── total_summary.csv
+    ├── total_summary.csv
+    └── total_eval.csv
 """
 
 import gc
 import os
+import re
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 import pypsa
 
+from cases import RAW_FOLDER, scenario_folder
+
+# Defaults relative to the repository, independent of the working directory
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+DEFAULT_RESULTS_FOLDER = os.path.join(REPO_ROOT, "results")
+DEFAULT_GENERATION_DATA_FOLDER = os.path.join(REPO_ROOT, "data", "generation_data")
+
+LHV = 33.33  # kWh/kg H2
+
+# Name and index-pattern of each scenario variation, in the order of the
+# buckets get_base_index() returns after the base sweep. Callers unpack by
+# position, so new variations go at the end. CCS patterns end with "_" or end
+# of string, "_CCS_50" is a prefix of "_CCS_500"; the 200 Mt base level has no
+# suffix. net_zero and vopt have no runs and are always empty.
+VARIATION_PATTERNS = {
+    "noUGHS": "_noUGHS",
+    "pct6": "_6pct",
+    "pct3": "_3pct",
+    "net_zero": "net_zero",
+    "vopt": "_vopt",
+    "wind_1_2": "_wind_1_2",
+    "CCS_50": "_CCS_50(?:_|$)",
+    "CCS_100": "_CCS_100(?:_|$)",
+    "CCS_300": "_CCS_300(?:_|$)",
+    "CCS_400": "_CCS_400(?:_|$)",
+    "CCS_500": "_CCS_500(?:_|$)",
+    "CCS_600": "_CCS_600(?:_|$)",
+    "CCS_900": "_CCS_900(?:_|$)",
+    "CCS_1200": "_CCS_1200(?:_|$)",
+    "transport": "_transport",
+    "elheat0": "_elheat0",
+}
+
+
+def scenario_folders(raw_folder: str = None, only_subfolders: list = None) -> dict:
+    """
+    Folders of the scenarios to process, as {scenario: folder}.
+
+    Without `only_subfolders`, every subfolder of `raw_folder` (default:
+    data/raw/) is a scenario. With `only_subfolders`, each named scenario is
+    taken from `raw_folder` if given, otherwise from the folders in
+    `cases.RESULT_ROOTS` (data/raw/, then `cases.EXTRA_RAW_FOLDERS`).
+
+    Raises
+    ------
+    FileNotFoundError
+        If `raw_folder` or a named scenario does not exist.
+    """
+    if raw_folder is not None:
+        raw_folder = os.path.abspath(raw_folder)
+        if not os.path.isdir(raw_folder):
+            raise FileNotFoundError(f"Raw results folder not found: {raw_folder}")
+
+    if only_subfolders is None:
+        root = raw_folder or RAW_FOLDER
+        if not os.path.isdir(root):
+            raise FileNotFoundError(
+                f"Raw results folder not found: {root}. Unpack the solved "
+                "networks there, or pass raw_folder."
+            )
+        names = next(os.walk(root))[1]
+        folders = {name: os.path.join(root, name) for name in names}
+    elif raw_folder is not None:
+        missing = [
+            s for s in only_subfolders if not os.path.isdir(os.path.join(raw_folder, s))
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"only_subfolders not found in {raw_folder}: {sorted(missing)}"
+            )
+        folders = {s: os.path.join(raw_folder, s) for s in only_subfolders}
+    else:
+        folders = {s: scenario_folder(s) for s in only_subfolders}
+
+    return {s: folders[s] for s in sorted(folders, key=scenario_sort_key)}
+
 
 def node_solar_irradiance_and_distance_to_UGHS(
     eval_df, n, timestep, system_buses, ughs_systems
 ):
     eval_df = eval_df.copy()
-    # TODO: this could be interesting for electrolysis as well and for Hydrogen demand centers
 
     # solar irradiance in kWh/a/m^2
     # get solar irradiance at generator locations (photocatalysis)
@@ -130,6 +206,49 @@ def calculate_pipeline_TWkm(
         return pipeline_TWkm, total_pipeline_annual_cost
 
 
+def format_nodal_el_pc(nodal_df: pd.DataFrame, round_digits: int = 5) -> str:
+    """
+    Convert a nodal EL/PC DataFrame into the "node:el:pc;" string format used
+    by the `nodal capacity node:el:pc` and `nodal LCOH node:el:pc` columns of
+    total_summary.csv.
+    """
+    values = nodal_df[["EL", "PC"]].astype(float).round(round_digits).astype(str)
+
+    return "".join(
+        f"{node}:{el}:{pc};"
+        for node, el, pc in zip(values.index, values["EL"], values["PC"])
+    )
+
+
+def parse_nodal(cell: str, columns: list) -> pd.DataFrame:
+    """
+    A "node:a:b;..." cell of total_summary.csv, as written by
+    `format_nodal_el_pc()`, as a node-indexed table.
+    """
+    records = [entry.split(":") for entry in cell.split(";")[:-1]]
+    return (
+        pd.DataFrame(records, columns=["node"] + columns)
+        .set_index("node")
+        .astype(float)
+    )
+
+
+def total_annualized_system_cost(n):
+    """
+    Full annualized system cost in EUR/a: annuity (`capital_cost` times the
+    optimized capacity) plus operational cost of every component.
+
+    n.statistics.system_cost().sum() in PyPSA >= 1.0
+
+    Args:
+        n (pypsa.components.Network): solved PyPSA network
+
+    Returns:
+        float: total annualized system cost in EUR/a
+    """
+    return float(n.statistics.capex().sum() + n.statistics.opex().sum())
+
+
 def get_total_brutto_power_generation(n):
     """
     Calculate total initial electricity input due to power generation in the
@@ -188,15 +307,98 @@ def get_total_brutto_power_generation(n):
     return total_power_generation  # TWh
 
 
-def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataFrame:
+def scenario_sort_key(name: str) -> tuple:
+    """
+    Natural sort key for scenario folder names: numbers are compared as numbers,
+    text case-insensitively. Orders by CAPEX first (660, 700, ..., 950) and, per
+    CAPEX, the base run before its variations, with CCS levels in numeric order
+    (CCS_50, CCS_100, ..., CCS_1200).
+    """
+    return tuple(
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", name)
+    )
+
+
+# Rows that precede the scenario rows in the two summary CSVs
+_SUMMARY_HEAD_ROWS = {
+    "total_summary.csv": ["Unit"],
+    "total_eval.csv": ["solar_irradiance", "shortest_path_length_to_UGHS"],
+}
+
+
+def _eval_row_sort_key(row_name: str) -> tuple:
+    # "el_cap_<scenario>" / "pc_cap_<scenario>": by scenario, el before pc
+    prefix, scenario = row_name[:7], row_name[7:]
+    return (scenario_sort_key(scenario), prefix)
+
+
+def sort_summary_csvs(results_folder: str = None) -> None:
+    """
+    Reorder the scenario rows of `total_summary.csv` and `total_eval.csv` with
+    `scenario_sort_key`, in place.
+
+    Works on the text lines, so the values are written back byte for
+    byte; header and unit/metadata rows stay on top.
+    """
+    if results_folder is None:
+        results_folder = DEFAULT_RESULTS_FOLDER
+
+    for filename, head_rows in _SUMMARY_HEAD_ROWS.items():
+        path = os.path.join(results_folder, filename)
+        if not os.path.exists(path):
+            continue
+        with open(path, newline="") as f:
+            lines = f.read().splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+
+        header, rows = lines[0], lines[1:]
+        names = [row.split(",", 1)[0] for row in rows]
+        head = [rows[names.index(h)] for h in head_rows if h in names]
+        body = [row for row, name in zip(rows, names) if name not in head_rows]
+        key = _eval_row_sort_key if filename == "total_eval.csv" else scenario_sort_key
+        body.sort(key=lambda row: key(row.split(",", 1)[0]))
+
+        with open(path, "w", newline="") as f:
+            f.writelines([header, *head, *body])
+
+
+def create_summary_csv(
+    results_folder: str = None,
+    re_create_tot_sum: bool = False,
+    only_subfolders: list = None,
+    raw_folder: str = None,
+    generation_data_folder: str = None,
+    per_network=None,
+) -> pd.DataFrame:
     """
     Function for assessing PyPSA-Eur results (i.e., .nc-files) and writing the
-    results to a .csv-file.
+    results to a .csv-file. The networks can be read from another folder than
+    the one the CSVs are written to.
 
     Parameters
     ----------
-    results_folder : str
-        Relative path to the sub-directories containing the .nc-files (in /raw)
+    results_folder : str, optional
+        Folder holding `total_summary.csv` / `total_eval.csv`, which are read,
+        appended to and written here. Defaults to the repository's `results/`.
+    re_create_tot_sum : bool, optional
+        If True, reprocess every subfolder and overwrite the CSVs from scratch.
+        If False (default), skip subfolders already present in
+        `total_summary.csv` and append only the new ones.
+    only_subfolders : list, optional
+        process only given subfolders ("already processed" will still skip logic unless re_create_tot_sum is True)
+    raw_folder : str, optional
+        Folder containing the per-scenario subfolders with the .nc-files.
+        Defaults to data/raw/; scenarios named in `only_subfolders` are then
+        also looked up in `cases.EXTRA_RAW_FOLDERS`.
+    generation_data_folder : str, optional
+        Folder the per-scenario `generation_<name>.csv` files are written to.
+        Defaults to the repository's `data/generation_data/`.
+    per_network : callable, optional
+        Called as `per_network(n, subfolder)` for every network that is read,
+        so that another evaluation can use the network while it is open, e.g.
+        `extract_bus_information.bus_size_writer()`. It must not change `n`.
 
     Returns
     -------
@@ -208,6 +410,11 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
     Exception
         If a sub-directory contains more than one .nc-file, an exception is raised.
     """
+    if results_folder is None:
+        results_folder = DEFAULT_RESULTS_FOLDER
+    if generation_data_folder is None:
+        generation_data_folder = DEFAULT_GENERATION_DATA_FOLDER
+
     total_summary_df = None
     total_eval_df = None
 
@@ -220,12 +427,10 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
     except FileNotFoundError:
         tot_sum = None
 
-    # TODO: think about transposing the total_summary data (so dtypes can be set better. Since the row with strings messes with the type of columns)
-    raw_files_folder = os.path.join(results_folder, "raw/")
-    subfolder_list = next(os.walk(raw_files_folder))[1]
+    folders = scenario_folders(raw_folder, only_subfolders)
 
     tot_eval_distance_ran_once = False
-    for i, subfolder in enumerate(subfolder_list):
+    for i, (subfolder, folder) in enumerate(folders.items()):
         if tot_sum is not None and (re_create_tot_sum == False):
             # Only process file if not already processed (if not forced)
             if subfolder in files_already_checked:
@@ -235,35 +440,34 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
                 continue
 
         # find all .nc-files within the subfolder (should be only one)
-        pypsa_files = [
-            file
-            for file in os.listdir(os.path.join(raw_files_folder, subfolder))
-            if file.endswith(".nc")
-        ]
+        pypsa_files = [file for file in os.listdir(folder) if file.endswith(".nc")]
 
         # more than one .nc-file in the same subfolder raises an exception
         if len(pypsa_files) > 1:
             raise Exception(
                 "More than one .nc-file in the subdirectory. "
-                + f"Please check data in {os.path.join(raw_files_folder, subfolder)}"
+                + f"Please check data in {folder}"
             )
 
         # import the PyPSA-Eur results
         try:
             print(
-                f"Importing the following file: {os.path.join(raw_files_folder, subfolder, pypsa_files[0])}"
+                f"Importing the following file: {os.path.join(folder, pypsa_files[0])}"
             )
-            n = pypsa.Network(os.path.join(raw_files_folder, subfolder, pypsa_files[0]))
+            n = pypsa.Network(os.path.join(folder, pypsa_files[0]))
         except IndexError as e:
             print(
                 "Warning! There is no .nc-file in the subdirectory. Directory is skipped."
-                + f"Please check data in {os.path.join(raw_files_folder, subfolder)}"
+                + f"Please check data in {folder}"
                 + f"Error: {e}"
             )
             continue
 
-        # Export demand data to the data/demand_data
-        store_demand_and_generation_data(n, subfolder)
+        if per_network is not None:
+            per_network(n, subfolder)
+
+        # Export nodal hydrogen generation and demand to data/generation_data/
+        store_demand_and_generation_data(n, subfolder, generation_data_folder)
 
         # Column, unit matching:
         col_unit_map = {
@@ -311,7 +515,6 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
             "total new H2 pipeline capacity cost": ["Euro"],
             "total repurposed H2 pipeline capacity": ["TWkm"],
             "total repurposed H2 pipeline capacity cost": ["Euro"],
-            # TODO: check if this is Euro or Euro/year (https://pypsa.readthedocs.io/en/latest/user-guide/optimal-power-flow.html)
             "total system cost": ["Euro"],
             "ughs allowed": ["-"],
             "pc larger 1MW": ["-"],
@@ -483,18 +686,7 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
         nodal_capacity.loc[el_capacity.index, "EL"] = el_capacity
         nodal_capacity.loc[pc_capacity.index, "PC"] = pc_capacity
 
-        # TODO: Check implementation (there should be a more elegant way to do this concatenation!)
-        round_digits = 5
-        nodal_capacity_string = ""
-        for row in nodal_capacity.index:
-            nodal_capacity_string += (
-                row
-                + ":"
-                + str(np.round(nodal_capacity.loc[row, "EL"], round_digits))
-                + ":"
-                + str(np.round(nodal_capacity.loc[row, "PC"], round_digits))
-                + ";"
-            )
+        nodal_capacity_string = format_nodal_el_pc(nodal_capacity)
 
         # calculate h2 generation per location
         el_nodal_h2_generation_ts = -(n.links_t.p1.loc[:, el_ind]) * timestep
@@ -539,25 +731,14 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
         LCOH_pc[pc_capacity < clip_capacity] = np.nan
 
         # LCOH in € / kg
-        LCOH_el_per_kg = LCOH_el / 1000 * 33.33
-        LCOH_pc_per_kg = LCOH_pc / 1000 * 33.33
+        LCOH_el_per_kg = LCOH_el / 1000 * LHV
+        LCOH_pc_per_kg = LCOH_pc / 1000 * LHV
 
         nodal_LCOH = pd.DataFrame(index=el_capacity.index, columns=["EL", "PC"])
         nodal_LCOH.loc[el_capacity.index, "EL"] = LCOH_el_per_kg
         nodal_LCOH.loc[pc_capacity.index, "PC"] = LCOH_pc_per_kg
 
-        # TODO: Check implementation (there should be a more elegant way to do this concatenation!)
-        round_digits = 5
-        nodal_LCOH_string = ""
-        for row in nodal_LCOH.index:
-            nodal_LCOH_string += (
-                row
-                + ":"
-                + str(np.round(nodal_LCOH.loc[row, "EL"], round_digits))
-                + ":"
-                + str(np.round(nodal_LCOH.loc[row, "PC"], round_digits))
-                + ";"
-            )
+        nodal_LCOH_string = format_nodal_el_pc(nodal_LCOH)
 
         total_power_generation = get_total_brutto_power_generation(n)
 
@@ -585,7 +766,7 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
             "total new H2 pipeline capacity cost": total_new_h2_pipeline_cost,
             "total repurposed H2 pipeline capacity": total_repurposed_h2_pipeline_TWkm,
             "total repurposed H2 pipeline capacity cost": total_repurposed_h2_pipeline_cost,
-            "total system cost": n.objective,
+            "total system cost": total_annualized_system_cost(n),
             "ughs allowed": ughs_expandable,
             "pc larger 1MW": ";".join(pc_generator_regions),
             "nodal capacity node:el:pc": nodal_capacity_string,
@@ -625,7 +806,8 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
         eval_df.loc[f"el_cap_{subfolder}"] = el_locations.loc[
             el_locations.index, "p_nom_opt"
         ]
-        # TODO: this pc_locations is not clipped, pc_generators is clipped at 1MW, maybe change this! (same for electrolysis!)
+
+        # this pc_locations is not clipped, pc_generators is clipped at 1MW, maybe change this! (same for electrolysis!)
         eval_df.loc[f"pc_cap_{subfolder}"] = pc_locations.loc[
             pc_locations.index, "p_nom_opt"
         ]
@@ -636,7 +818,6 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
             # create a new DataFrame for storing location dependent results of all .nc-files
             total_eval_df = eval_df.copy()
         else:
-            # TODO: Check if this is the right way to add this!
             # merge summary_df into total_summary_df; delete duplicates (i.e., 'Unit')
             total_summary_df = pd.concat(
                 [total_summary_df, summary_df]
@@ -647,46 +828,60 @@ def create_summary_csv(results_folder: str, re_create_tot_sum: bool) -> pd.DataF
                 keep="first"
             )
 
-            total_summary_df.to_csv(os.path.join(results_folder, "total_summary.csv"))
-            total_eval_df.to_csv(os.path.join(results_folder, "total_eval.csv"))
-
         # Clean up (alternatively I could encapsulate the file processing in a function)
         del n  # delete dataframe from RAM to stop clogging it
         gc.collect()  # call garbage collector
 
+    if total_summary_df is None:
+        # Every subfolder was skipped, so there is nothing to write.
+        print("Nothing to add. All files where already added before.")
+        return tot_sum
+
     if tot_sum is not None and re_create_tot_sum == False:
         # Append data
-        try:
-            total_summary_df.drop("Unit").to_csv(
-                os.path.join(results_folder, "total_summary.csv"),
-                mode="a",
-                index=True,
-                header=False,
-            )
-            total_eval_df.drop(
-                ["solar_irradiance", "shortest_path_length_to_UGHS"]
-            ).to_csv(
-                os.path.join(results_folder, "total_eval.csv"),
-                mode="a",
-                index=True,
-                header=False,
-            )
-        except UnboundLocalError:
-            print("Nothing to add. All files where already added before.")
-            total_summary_df = tot_sum
+        total_summary_df.drop("Unit").to_csv(
+            os.path.join(results_folder, "total_summary.csv"),
+            mode="a",
+            index=True,
+            header=False,
+        )
+        total_eval_df.drop(["solar_irradiance", "shortest_path_length_to_UGHS"]).to_csv(
+            os.path.join(results_folder, "total_eval.csv"),
+            mode="a",
+            index=True,
+            header=False,
+        )
     else:
         # Create tot sum
+        os.makedirs(results_folder, exist_ok=True)
         total_summary_df.to_csv(os.path.join(results_folder, "total_summary.csv"))
         total_eval_df.to_csv(os.path.join(results_folder, "total_eval.csv"))
+
+    # Appended rows land at the end; restore the natural scenario order
+    sort_summary_csvs(results_folder)
 
     return total_summary_df
 
 
-def store_demand_and_generation_data(network, name):
+def store_demand_and_generation_data(network, name, output_folder: str = None):
     """
     Function to store the cumulated demand and generation data for each
     location.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        The solved network to extract from.
+    name : str
+        Scenario (subfolder) name, used for the output filename.
+    output_folder : str, optional
+        Folder the `generation_<name>.csv` is written to. Defaults to the
+        repository's `data/generation_data/` and is created if missing.
     """
+    if output_folder is None:
+        output_folder = DEFAULT_GENERATION_DATA_FOLDER
+    os.makedirs(output_folder, exist_ok=True)
+
     netw = network.copy()
 
     # Store total hydrogen demand
@@ -723,7 +918,7 @@ def store_demand_and_generation_data(network, name):
     generation_df["total_h2_demand_MWh"] = tot_h2_demand_with_locs
 
     # Store hydrogen production and demand jointly
-    generation_df.to_csv(rf"./data/generation_data/generation_{name}.csv")
+    generation_df.to_csv(os.path.join(output_folder, f"generation_{name}.csv"))
 
 
 def extract_demand_and_generation_info(network, name):
@@ -738,8 +933,6 @@ def extract_demand_and_generation_info(network, name):
     Returns:
         dict: dict containing information on hydrogen demand
     """
-    # TODO: Store all this to only one file instead of multiple files (same with bus_sizes?!)
-
     n = network.copy()
     timestep = int(8760 / len(n.snapshots))
 
@@ -869,11 +1062,6 @@ def extract_demand_and_generation_info(network, name):
     return technos
 
 
-def load_total_summary(filepath):
-    total_summary_df = pd.read_csv(filepath, index_col=0)
-    return total_summary_df
-
-
 def recalc_capex(total_annuity):
     # annuity factor for PyPSA results to recalculate CAPEX in €/kW
     i = 0.07
@@ -886,10 +1074,46 @@ def recalc_capex(total_annuity):
     return CAPEX_recalc
 
 
-def load_df_without_unit_row(filepath):
-    # create a DataFrame without the "Unit"-column (to keep the code leaner)
+def load_df_without_unit_row(filepath: str) -> pd.DataFrame:
+    """
+    Load total_summary.csv (or a CSV with the same convention) without the unit
+    row, allows to get clean dtypes.
+    """
     df_without_unit = pd.read_csv(filepath, index_col=0, header=0, skiprows=range(1, 2))
     return df_without_unit
+
+
+def get_base_index(df: pd.DataFrame):
+    """
+    Split the summary index into the base scenario and the scenario variations.
+
+    Every bucket is sorted by scenario name, i.e. by CAPEX. Callers unpack the
+    tuple by position, so new categories go at the end.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The summary DataFrame containing scenario indices.
+
+    Returns
+    -------
+    tuple of pd.Index
+        base_index, followed by the noUGHS, 6pct, 3pct, net_zero, vopt,
+        wind_1_2, CCS_50/100/300/400/500/600/900/1200, transport and elheat0
+        variations. net_zero and vopt have no runs and are always empty.
+    """
+
+    variation_indices = [
+        df.index[df.index.str.contains(pattern)].sort_values()
+        for pattern in VARIATION_PATTERNS.values()
+    ]
+
+    # match "_CCS_" generically as well, so a new CCS level does not end up in base
+    base_index = df.index.difference(df.index[df.index.str.contains("_CCS_")])
+    for indices in variation_indices:
+        base_index = base_index.difference(indices)
+
+    return (base_index, *variation_indices)
 
 
 def calc_full_load_hours(installed_capacity_GW, generated_energy_TWh):
@@ -898,22 +1122,24 @@ def calc_full_load_hours(installed_capacity_GW, generated_energy_TWh):
 
 
 if __name__ == "__main__":
-    # This should be the folder where all the raw result files are placed.
-    results_folder = "./results/"
+    # Options, see create_summary_csv()
+    results_folder = DEFAULT_RESULTS_FOLDER
+    raw_folder = None  # default data/raw/, see cases.py
+    generation_data_folder = DEFAULT_GENERATION_DATA_FOLDER
+    only_subfolders = None  # e.g. ["150_lv1.25_I_H_2045_PC_660Euro"]
+    re_create_tot_sum = False
 
-    # toggle creation of csv-summary
-    create_new_csv_bool = True
-    print(f"Option for creating CSV-summary is set to {create_new_csv_bool}.")
-    if create_new_csv_bool:
-        print("New CSV-summary is created!")
-        total_summary_df = create_summary_csv(
-            results_folder, re_create_tot_sum=create_new_csv_bool
-        )
+    if re_create_tot_sum:
+        print("Recreating CSV-summary from scratch (reprocessing all subfolders).")
     else:
         print(
-            "No new CSV-summary is created.\nNew data appended to existing file and "
-            + f"results are read from {os.path.join(results_folder,'total_summary.csv')}"
+            "Appending only new subfolders to the existing summary "
+            + f"({os.path.join(results_folder, 'total_summary.csv')})."
         )
-        total_summary_df = create_summary_csv(
-            results_folder, re_create_tot_sum=create_new_csv_bool
-        )
+    total_summary_df = create_summary_csv(
+        results_folder,
+        re_create_tot_sum=re_create_tot_sum,
+        only_subfolders=only_subfolders,
+        raw_folder=raw_folder,
+        generation_data_folder=generation_data_folder,
+    )

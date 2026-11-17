@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: 2025 Wolfram Tuschewitzki, Jelto Lange
+#
+# SPDX-License-Identifier: MIT
 import os
 
 import matplotlib.pyplot as plt
-import networkx as nx
 import numpy as np
 import pandas as pd
 import pypsa
 import yaml
 from mpl_toolkits.axisartist.axislines import AxesZero
 
-from create_basic_summary import calculate_pipeline_TWkm
+from cases import REPO_ROOT
+from create_basic_summary import calculate_pipeline_TWkm, load_df_without_unit_row
 
 
 def dim_opcost_invest(
@@ -62,7 +65,14 @@ def dim_opcost_invest(
             * timestep
         )
     elif dim_type == "capacity":
-        dim = component_table_filtered[p_or_e].sum() / dim_scaling
+        capacity_table = component_table_filtered
+        if comp_type == "links":
+            # Bidirectional links (DC, electricity distribution grid) have a
+            # "-reversed" twin with the same p_nom and capital_cost 0
+            capacity_table = capacity_table[
+                ~capacity_table.index.str.endswith("-reversed")
+            ]
+        dim = capacity_table[p_or_e].sum() / dim_scaling
     else:
         raise ValueError(
             "dim_type should be energy or capacity depending on the fact if a time dependent or time independent value should be returned"
@@ -245,15 +255,20 @@ def calc_syn_fuel_box_values(n_el, n_pc):
         "FT": {
             "carrier": "Fischer-Tropsch",
             "dim_col": "p1",
-            "op_col": "p1",
-        },  # [TWh/a, Bln. €/a] bus 1 is the local oil or  methanol bus; negative values equate to oil or methanol going out of the link (into the bus)
+            "op_col": "p0",
+        },  # [TWh/a, Bln. €/a] bus 1 is the local oil or  methanol bus; negative values equate to oil or methanol going out of the link (into the bus). marginal_cost is charged on p0 (the hydrogen input)
+        "Sabatier": {
+            "carrier": "Sabatier",
+            "dim_col": "p1",
+            "op_col": "p0",
+        },  # [TWh/a, Bln. €/a] bus 1 is the EU gas bus; negative values equate to methane going out of the link (into the bus). bus 0 is the hydrogen input the marginal cost applies to
     }
 
     dim_scaling = 1e6
     dim_type = "time_dependent"
 
     df_syn_fuels = pd.DataFrame(columns=["Installation", "Opex", "Invest"])
-    for techology, vals in syn_fuel_mapping.items():
+    for technology, vals in syn_fuel_mapping.items():
         dim_diff, op_diff, inv_diff = calc_diffs(
             n_el,
             n_pc,
@@ -265,17 +280,33 @@ def calc_syn_fuel_box_values(n_el, n_pc):
             dim_type,
             timestep,
         )
-        df_syn_fuels.loc[techology] = [dim_diff, op_diff, inv_diff]
+        df_syn_fuels.loc[technology] = [dim_diff, op_diff, inv_diff]
+
+    # Methanation is only built below 200 Mt CO2/a sequestration
+    sabatier_built = (
+        max(
+            abs(
+                dim_opcost_invest(
+                    network,
+                    "links",
+                    "p1",
+                    "p0",
+                    "Sabatier",
+                    dim_scaling,
+                    dim_type,
+                    timestep,
+                )[0]
+            )
+            for network in (n_el, n_pc)
+        )
+        > 1  # TWh/a of methane, against ~0.0003 in a base case
+    )
 
     # Ordering the content
-    df_syn_fuels = df_syn_fuels.loc[
-        [
-            "FT",
-            "MeOH",
-            "DAC",
-        ],
-        :,
-    ]
+    bar_order = ["FT", "MeOH", "DAC"]
+    if sabatier_built:
+        bar_order.insert(bar_order.index("DAC"), "Sabatier")
+    df_syn_fuels = df_syn_fuels.loc[bar_order, :]
 
     x_syn_fuels = np.arange(len(df_syn_fuels))
 
@@ -284,9 +315,15 @@ def calc_syn_fuel_box_values(n_el, n_pc):
         "DAC": "Direct air\ncapture",
         "MeOH": "Methanol\nsynthesis",
         "FT": "Fischer-\nTropsch",
+        "Sabatier": "Sabatier",
     }
 
     return df_syn_fuels, x_syn_fuels, name_map_syn_fuels
+
+
+# CHP capacity shown in the heating and power box
+# ["heat capacity", "electricity capacity", "gas capacity"]
+CHP_BOX_COLUMN = "heat capacity"
 
 
 def calc_power_and_h2_system_box_values(n_el, n_pc):
@@ -381,7 +418,6 @@ def calc_power_and_h2_system_box_values(n_el, n_pc):
             "rural gas boiler",
             "urban decentral gas boiler",
         ],
-        # "Gas CHP": ["urban central gas CHP", "urban central gas CHP CC"],
         # "Storage piping": [
         #     "rural water tanks charger",
         #     "rural water tanks discharger",
@@ -404,8 +440,6 @@ def calc_power_and_h2_system_box_values(n_el, n_pc):
         new_row = df_heating_all.loc[components, :].sum(axis=0)
         # Assign the new row to the DataFrame with the new name
         df_heating.loc[new_name] = new_row
-
-    # FIXME: Join this with the heating!
 
     # Power
     # - higher degree of decentralization,
@@ -469,7 +503,7 @@ def calc_power_and_h2_system_box_values(n_el, n_pc):
 
     # carr_co2_storage = ["co2", "co2 stored", "co2 sequestered"]
     # CO2 Storage was tested, no change here! Just using a bit of CO2 storage requires investment into CC which is expansive
-    # Rest emissions allowed thus is a lot cheaper than som sequestered CO2
+    # Rest emissions allowed thus is a lot cheaper than some sequestered CO2
 
     # HOW IS THE CONNECTION HERE between df_power and power_system_map?
     power_system_map = {
@@ -494,7 +528,13 @@ def calc_power_and_h2_system_box_values(n_el, n_pc):
         # Assign the new row to the DataFrame with the new name
         df_power_heating_and_grid.loc[new_name] = new_row
 
+    # Battery charger and discharger are one inverter: same p_nom, discharger cost 0
+    df_power_heating_and_grid.loc["Battery chargers", "Installation"] = df_power.loc[
+        ["home battery charger", "battery charger"], "Installation"
+    ].sum()
+
     name_map_power = {
+        "Gas CHP": "Gas\nCHP",
         "Battery chargers": "Battery\nchargers",
         "Electricity grid": "Electricity\ngrid",
         "Electricity storage": "Electricity\nstorage",
@@ -510,27 +550,43 @@ def calc_power_and_h2_system_box_values(n_el, n_pc):
         "Thermal Storage": "Thermal\nstorage",
     }
 
-    # Ordering the content
-    df_power_heating_and_grid = df_power_heating_and_grid.loc[
-        [
-            "Electricity grid",
-            "Electricity storage",
-            "Battery chargers",
-        ],
-        :,
-    ]
+    # Gas CHP sits next to the gas boilers: same fuel, same heat output side
+    # columns "Installation CC" / "Cost CC", drawn hatched on top of none CC
+    df_chp, _ = calc_chp_box_values(n_el, n_pc)
+    chp_base = df_chp.loc[CHP_BASE_CARRIER]
+    chp_cc = df_chp.loc[CHP_CC_CARRIER]
 
-    # TODO: Fix this here!
-    # Prepare new box power and heating system
+    # Prepare new box power and heating system; the .loc also sets the bar order
     df_power_and_heating_system = pd.concat(
         [
             df_heating,
             df_power_heating_and_grid.loc[
-                ["Battery chargers", "Electricity grid", "Electricity storage"]
+                ["Electricity storage", "Battery chargers", "Electricity grid"]
             ],
         ],
         axis=0,
     )
+    df_power_and_heating_system["Installation CC"] = 0.0
+    df_power_and_heating_system["Cost CC"] = 0.0
+
+    df_power_and_heating_system.loc["Gas CHP"] = {
+        "Installation": chp_base[CHP_BOX_COLUMN],
+        "Opex": chp_base["Opex"],
+        "Invest": chp_base["Invest"],
+        "Installation CC": chp_cc[CHP_BOX_COLUMN],
+        "Cost CC": chp_cc["Cost"],
+    }
+    bar_order = [
+        "Heat pumps",
+        "Resistive heaters",
+        "Gas boilers",
+        "Gas CHP",
+        "Thermal Storage",
+        "Electricity storage",
+        "Battery chargers",
+        "Electricity grid",
+    ]
+    df_power_and_heating_system = df_power_and_heating_system.loc[bar_order]
     x_power_and_heating_system = np.arange(len(df_power_and_heating_system))
     power_and_heating_system_name_map = name_map_power | name_map_heating
 
@@ -549,7 +605,7 @@ def calc_hydrogen_box(n_el, n_pc):
     def calc_total_hydrogen_pipeline_costs(n):
         # Hydrogen pipelines [TWkm, Bln. €/a]
         # Pipeline operational costs seem to be not important
-        # if you want to calcualte them: only pipelines with p_max_pu >= 0 energy bus0 * marginal cost
+        # if you want to calculate them: only pipelines with p_max_pu >= 0 energy bus0 * marginal cost
 
         # Calculate total pipeline capacity in TWkm
         (
@@ -630,305 +686,208 @@ def calc_hydrogen_box(n_el, n_pc):
     return df_hydrogen_system, x_hydrogen_system, hydrogen_system_name_map
 
 
-def plot_system_cost_differences(n_el, n_pc):
-    # Calculate all required data
-    (
-        df_energy_carriers,
-        x_energy_carriers,
-        name_map_energy_carriers,
-    ) = calc_energy_box_values(n_el, n_pc)
-    df_syn_fuels, x_syn_fuels, name_map_syn_fuels = calc_syn_fuel_box_values(n_el, n_pc)
-    df_hydrogen_system, x_hydrogen_system, hydrogen_system_name_map = calc_hydrogen_box(
-        n_el, n_pc
+CHP_CARRIERS = ("urban central gas CHP", "urban central gas CHP CC")
+
+# Plain gas CHP and its carbon-capture variant are stacks
+CHP_BASE_CARRIER = "urban central gas CHP"
+CHP_CC_CARRIER = "urban central gas CHP CC"
+
+
+def chp_flows(n, carrier):
+    """
+    Capacity and annual energy on all three sides of a CHP carrier.
+
+    `p_nom_opt` is the gas input capacity, bus1 is electricity, bus2 heat.
+
+    Args:
+        n (pypsa.components.Network): network to read the links from
+        carrier (str): CHP carrier, one of CHP_CARRIERS
+
+    Returns:
+        dict: capacities in GW (``gas capacity``, ``electricity capacity``,
+        ``heat capacity``) and annual energy in TWh/a (``electricity
+        generation``, ``heat generation``)
+    """
+    links = n.links[n.links.carrier == carrier]
+    keys = (
+        "gas capacity",
+        "electricity capacity",
+        "heat capacity",
+        "electricity generation",
+        "heat generation",
     )
-    (
-        df_power_and_heating_system,
-        x_power_and_heating_system,
-        power_and_heating_system_name_map,
-    ) = calc_power_and_h2_system_box_values(n_el, n_pc)
+    if links.empty:
+        return dict.fromkeys(keys, 0.0)
 
-    with open(r"./src/colors.yaml") as stream:
-        colors_dict = yaml.safe_load(stream)["others"]
+    bus1_carriers = set(n.buses.carrier[links.bus1])
+    bus2_carriers = set(n.buses.carrier[links.bus2])
+    assert bus1_carriers == {
+        "AC"
+    }, f"{carrier}: expected bus1 to be electricity, found {bus1_carriers}"
+    assert all(
+        "heat" in bus_carrier for bus_carrier in bus2_carriers
+    ), f"{carrier}: expected bus2 to be heat, found {bus2_carriers}"
 
-    rotation_deg = 0
-    width = 0.35  # Width of the bars
+    weights = n.snapshot_weightings.generators
+    # p1/p2 are negative for an outflow of the link
+    return {
+        "gas capacity": links.p_nom_opt.sum() / 1e3,
+        "electricity capacity": (links.p_nom_opt * links.efficiency).sum() / 1e3,
+        "heat capacity": (links.p_nom_opt * links.efficiency2).sum() / 1e3,
+        "electricity generation": (
+            -n.links_t.p1[links.index].sum(axis=1) * weights
+        ).sum()
+        / 1e6,
+        "heat generation": (-n.links_t.p2[links.index].sum(axis=1) * weights).sum()
+        / 1e6,
+    }
 
-    # Define the layout using a list of strings
-    layout = [
-        [
-            "A",
-            "A",
-            "A",
-            "A",
-            "A",
-            "A",
-            "A",
-        ],
-        [
-            "C",
-            "C",
-            "C",
-            "C",
-            "C",
-            "C",
-            "C",
-        ],
-        [
-            "B",
-            "B",
-            ".",
-            "D",
-            "D",
-            "D",
-            "E",
-        ],
-    ]
 
-    def create_bar_plot(ax, x_values, df, name_map, title, y_label_left, ax1_ylim):
-        ax.set_title(title)
+def calc_chp_box_values(n_el, n_pc):
+    """
+    Gas CHP panel (PC-system minus EL-only system).
 
-        # Plot the Installation bars on ax
-        ax.bar(
-            x_values - width / 2,
-            df["Installation"],
-            width,
-            label="Installation",
-            color=colors_dict["generation installation"],
+    The cost is returned once per carrier and not split between heat and
+    electricity.
+
+    Args:
+        n_el (pypsa.components.Network): EL-only (PC-0) network
+        n_pc (pypsa.components.Network): PC-system (PC-50) network
+
+    Returns:
+        tuple: (dataframe indexed by CHP_CARRIERS, name map)
+    """
+    timestep = int(8760 / len(n_el.snapshots))
+
+    rows = {}
+    for carrier in CHP_CARRIERS:
+        # cost differences on the gas input side, consistent with the boilers
+        _, op_diff, inv_diff = calc_diffs(
+            n_el,
+            n_pc,
+            "links",
+            "",
+            "p0",
+            carrier,
+            1e3,
+            "capacity",
+            timestep,
         )
-        ax.set_ylabel(y_label_left, color=colors_dict["generation installation"])
-        ax.tick_params(axis="y", labelcolor=colors_dict["generation installation"])
+        flows_el = chp_flows(n_el, carrier)
+        flows_pc = chp_flows(n_pc, carrier)
+        row = {key: np.round(flows_pc[key] - flows_el[key], 2) for key in flows_el}
+        row["Opex"] = op_diff
+        row["Invest"] = inv_diff
+        row["Cost"] = np.round(op_diff + inv_diff, 2)
+        rows[carrier] = row
 
-        # Create a secondary y-axis for the stacked bars
-        ax2 = ax.twinx()
-        # Stack Invest and Opex on top of each other
-        ax2.bar(
-            x_values + width / 2,
-            df["Invest"],
-            width,
-            label="Invest",
-            color=colors_dict["annualized costs"],
+    df_chp = pd.DataFrame(rows).T
+
+    chp_name_map = {
+        CHP_BASE_CARRIER: "Gas CHP",
+        CHP_CC_CARRIER: "Gas CHP\nwith CC",
+    }
+
+    return df_chp, chp_name_map
+
+
+HEAT_BUS_CARRIERS = ("urban central heat", "urban decentral heat", "rural heat")
+
+# By-product heat: heat on a secondary output (bus2 and higher) of a link.
+# Link carrier -> source, as named in the figure legend
+BYPRODUCT_HEAT_SOURCES = {
+    "H2 Electrolysis": "electrolysis",
+    "Fischer-Tropsch": "fuel synthesis",
+    "methanolisation": "fuel synthesis",
+    "Sabatier": "fuel synthesis",
+    "H2 Fuel Cell": "fuel cells",
+}
+
+
+def byproduct_heat_capacity(n):
+    """
+    Heat output capacity of the by-product heat per link carrier, in GW.
+
+    `p_nom_opt` is on bus0, so the heat capacity is `p_nom_opt` times the
+    efficiency of the heat output, the measure of the gas CHP bar. Gas CHP is
+    left out: heat is one of its two products, and it has a bar of its own.
+    Electrolyzers at nodes without an urban central heat bus deliver no heat
+    and do not count.
+
+    Raises for a carrier with heat on a secondary output that is neither gas
+    CHP nor in BYPRODUCT_HEAT_SOURCES, so no source drops out unnoticed.
+    """
+    heat_bus_carriers = set(n.buses.carrier[n.buses.carrier.str.contains("heat")])
+    unknown_buses = heat_bus_carriers - set(HEAT_BUS_CARRIERS)
+    if unknown_buses:
+        raise RuntimeError(
+            f"heat bus carriers not in HEAT_BUS_CARRIERS: {unknown_buses}"
         )
-        ax2.bar(
-            x_values + width / 2,
-            df["Opex"],
-            width,
-            label="Opex",
-            color=colors_dict["annualized costs"],
-            bottom=df["Invest"],
+    heat_buses = n.buses.index[n.buses.carrier.isin(HEAT_BUS_CARRIERS)]
+
+    ports = sorted(
+        int(column[3:])
+        for column in n.links.columns
+        if column.startswith("bus") and column[3:].isdigit() and int(column[3:]) >= 2
+    )
+    capacity = {}
+    for port in ports:
+        efficiency = f"efficiency{port}"
+        links = n.links[n.links[f"bus{port}"].isin(heat_buses)]
+        if links.empty:
+            continue
+        varying = n.links_t.get(efficiency, pd.DataFrame()).columns.intersection(
+            links.index
         )
-
-        # Add labels and titles
-        ax2.set_ylabel(
-            "Difference in annualized\ncosts in Bln. € a$^{-1}$",
-            color=colors_dict["annualized costs"],
-        )
-        ax2.tick_params(axis="y", labelcolor=colors_dict["annualized costs"])
-        ax.set_xticks(x_values)
-        ax.set_xticklabels(
-            [name_map[key] for key in df.index],
-            rotation=rotation_deg,
-        )
-
-        # Fix axis spread
-        ax.set_ylim(ax1_ylim)
-        ax.set_xlim([-0.5, len(df) - 0.5])
-        ax2.set_ylim(ax1_ylim / 15)
-
-        # Grid and tick customization
-        ax.grid(alpha=0.3)
-        ax.tick_params(axis="both", direction="in", bottom=True, top=True, left=True)
-        ax2.tick_params(axis="both", direction="in", right=True)
-
-        return ax2
-
-    def setup_axes_zero(fig, position):
-        """
-        Creates and configures an AxesZero on the given figure at the specified
-        position.
-        """
-        ax = fig.add_axes(position, axes_class=AxesZero)
-        for direction in ["xzero", "yzero"]:
-            ax.axis[direction].set_axisline_style("-|>")
-            ax.axis[direction].set_visible(True)
-
-        for direction in ["left", "right", "bottom", "top"]:
-            ax.axis[direction].set_visible(False)
-
-        ax.set_ylim([-2.2, 5.2])
-        ax.set_yticks([])
-        ax.set_xticks([])
-        return ax
-
-    def plot_bars(ax):
-        """
-        Plots bar data on the given axis.
-        """
-
-        ax.bar(
-            x=[0.2, 1.2, 2.2, 3.8, 4.8, 5.8],
-            height=[5, 3, 2, 5, 7, 2],
-            width=[0.9] * 6,
-            bottom=[0, 2, 0, 0, -2, -2],
-            align="edge",
-            color=[
-                colors_dict["pc-50"],
-                colors_dict["pc-0"],
-                colors_dict["difference"],
-            ],
-            label=["PC-50", "PC-0", "Difference", "", "", ""],
-        )
-
-    def plot_lines_and_arrows(ax):
-        """
-        Adds lines and arrows annotations to the given axis.
-        """
-        lw = 1.5
-        lines = [
-            ([0.2, 2.1], [5, 5]),
-            ([1.2, 3.1], [2, 2]),
-            ([3.8, 5.7], [5, 5]),
-            ([4.8, 6.7], [-2, -2]),
-        ]
-        for x, y in lines:
-            ax.plot(x, y, "k", linewidth=lw)
-
-        arrows = {
-            "bm-1": {"xy": (0.65, 0), "xyt": (0.65, 5), "ls": "--", "a": 0.5},
-            "el-1": {"xy": (1.65, 5), "xyt": (1.65, 2), "ls": "--", "a": 0.5},
-            "d-1": {"xy": (2.65, 0), "xyt": (2.65, 2), "ls": "-", "a": 1},
-            "bm-2": {"xy": (4.25, 0), "xyt": (4.25, 5), "ls": "--", "a": 0.5},
-            "el-2": {"xy": (5.25, 5), "xyt": (5.25, -2), "ls": "--", "a": 0.5},
-            "d-2": {"xy": (6.25, 0), "xyt": (6.25, -2), "ls": "-", "a": 1},
-        }
-        for v in arrows.values():
-            ax.annotate(
-                "",
-                xy=v["xy"],
-                xytext=v["xyt"],
-                color="k",
-                arrowprops=dict(
-                    arrowstyle="<-",
-                    linestyle=v["ls"],
-                    alpha=v["a"],
-                    color="k",
-                ),
+        if len(varying):
+            raise RuntimeError(
+                f"time-varying {efficiency} on heat outputs: {list(varying)}"
             )
+        per_carrier = (links.p_nom_opt * links[efficiency]).groupby(
+            links.carrier
+        ).sum() / 1e3
+        for carrier, value in per_carrier.items():
+            capacity[carrier] = capacity.get(carrier, 0.0) + value
 
-    # Create the mosaic plot
-    fig, ax_dict = plt.subplot_mosaic(layout, figsize=(8, 10))
-
-    create_bar_plot(
-        ax=ax_dict["A"],
-        x_values=x_energy_carriers,
-        df=df_energy_carriers,
-        name_map=name_map_energy_carriers,
-        title="Electricity and hydrogen production",
-        y_label_left="Difference in energy\ngeneration in TWh a$^{-1}$",
-        ax1_ylim=np.array([-1000, 1300]),
+    capacity = pd.Series(capacity, dtype=float).drop(
+        list(CHP_CARRIERS), errors="ignore"
     )
+    unknown = capacity.index.difference(list(BYPRODUCT_HEAT_SOURCES))
+    if len(unknown):
+        raise RuntimeError(f"by-product heat carriers in no source: {list(unknown)}")
+    return capacity
 
-    create_bar_plot(
-        ax=ax_dict["B"],
-        x_values=x_hydrogen_system,
-        df=df_hydrogen_system,
-        name_map=hydrogen_system_name_map,
-        title="Hydrogen system",
-        y_label_left="Difference in storage capacity in TWh\nand transport capacity in TWkm ",
-        ax1_ylim=np.array([0, 50]),
-    )
 
-    create_bar_plot(
-        ax=ax_dict["C"],
-        x_values=x_power_and_heating_system,
-        df=df_power_and_heating_system,
-        name_map=power_and_heating_system_name_map,
-        title="Heating and power system",
-        y_label_left="Difference in installed capacity\nin GW and TWh (storage)",
-        ax1_ylim=np.array([-150, 150]),
-    )
+def calc_byproduct_heat_box_values(n_el, n_pc, noise=0.05):
+    """
+    By-product heat bar of the heating and power box (PC-system minus EL-only
+    system), heat output capacity in GW.
 
-    ax2 = create_bar_plot(
-        ax=ax_dict["D"],
-        x_values=x_syn_fuels,
-        df=df_syn_fuels,
-        name_map=name_map_syn_fuels,
-        title="Synthetic fuels",
-        y_label_left="Difference in generation in TWh a$^{-1}$\nand Mt CO$_2$ a$^{-1}$ (DAC)",
-        ax1_ylim=np.array([0, 150]),
-    )
+    Several carriers of one source are netted, as in the other grouped bars.
 
-    # Show the plot
-    handles1, labels1 = ax_dict["A"].get_legend_handles_labels()
-    handles2, labels2 = ax2.get_legend_handles_labels()
-    labels = ["Yearly generation / total installation", "Annualized costs per year"]
-    fig.legend(
-        handles1 + [handles2[0]],
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0),
-        ncol=3,
-        frameon=False,
-        fancybox=False,
-    )
-
-    plt.subplots_adjust(left=0, bottom=0.07, right=1, top=0.9, wspace=0.5, hspace=0.3)
-
-    ### Add explanatory legend plot
-    # Define bounding position and remove the placeholder axis
-    bounds_orig = ax_dict["E"].get_position(fig).bounds
-    bounds = (0.945, 0.085, 0.15, 0.18)
-    fig.delaxes(ax_dict["E"])
-
-    # # Create and set up AxesZero
-    ax_explain = setup_axes_zero(fig, bounds)
-    # # Plot components
-    plot_bars(ax_explain)
-    plot_lines_and_arrows(ax_explain)
-    ax_explain.set_title("Difference\nexplanation")
-
-    # # Add legend
-    ax_explain.legend(
-        ["PC-50", "PC-0", "Difference"],
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0),
-        frameon=False,
-        fancybox=False,
-    )
-
-    # Draw a rectangle on the entire figure (not inside any specific axis)
-    rect = plt.Rectangle(
-        (bounds[0] - 0.015, bounds[1] - 0.081),
-        bounds[2] + 0.04,
-        bounds[-1] + 0.124,
-        transform=fig.transFigure,
-        facecolor="white",
-        edgecolor="black",
-        fill=False,
-    )
-    fig.patches.append(rect)
-
-    plt.show()
-
-    # fig.savefig(
-    #     r"../img/system_cost_difference.svg",
-    #     format="svg",
-    #     bbox_inches="tight",
-    # )
+    Returns:
+        pandas.Series: difference per source in the order of
+        BYPRODUCT_HEAT_SOURCES, sources below `noise` dropped
+    """
+    capacity = pd.DataFrame(
+        {"el": byproduct_heat_capacity(n_el), "pc": byproduct_heat_capacity(n_pc)}
+    ).fillna(0.0)
+    difference = (capacity["pc"] - capacity["el"]).groupby(BYPRODUCT_HEAT_SOURCES).sum()
+    order = list(dict.fromkeys(BYPRODUCT_HEAT_SOURCES.values()))
+    difference = difference.reindex(order).dropna()
+    return difference[difference.abs() >= noise].round(2)
 
 
 def calculate_total_system_difference():
-    summary_df = pd.read_csv(
-        "../results/total_summary.csv",
-        index_col=0,
-        header=0,
-        skiprows=range(1, 2),
+    summary_df = load_df_without_unit_row(
+        os.path.join(REPO_ROOT, "results", "total_summary.csv")
     )
 
     balanced_mix_system_cost = summary_df.loc[
-        "150_lv1.25_I_H_2045_3H_PC_650Euro", "total system cost"
+        "150_lv1.25_I_H_2045_PC_660Euro", "total system cost"
     ]
     el_100_system_cost = summary_df.loc[
-        "150_lv1.25_I_H_2045_3H_PC_925Euro", "total system cost"
+        "150_lv1.25_I_H_2045_PC_950Euro", "total system cost"
     ]
 
     cost_reduction_in_percent = (
@@ -939,16 +898,10 @@ def calculate_total_system_difference():
 
 
 def main():
-    # Network files for base and mixed scenario
-
-    folder_path = r"results/raw"
-    file_el_only = r"150_lv1.25_I_H_2045_3H_PC_925Euro/elec_s_150_lv1.25__I-H_2045.nc"
-    file_mix = r"150_lv1.25_I_H_2045_3H_PC_650Euro/elec_s_150_lv1.25__I-H_2045.nc"
-    n_el = pypsa.Network(os.path.join(folder_path, file_el_only))
-    n_pc = pypsa.Network(os.path.join(folder_path, file_mix))
-
-    plot_system_cost_differences(n_el, n_pc)
-    print(calculate_total_system_difference())
+    print(
+        f"Total system cost difference PC-0 vs PC-50: "
+        f"{calculate_total_system_difference():.2f} %"
+    )
 
 
 if __name__ == "__main__":
