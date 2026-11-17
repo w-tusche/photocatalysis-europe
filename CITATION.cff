@@ -6,10 +6,7 @@ version: 0.3.0
 repository-code: https://github.com/w-tusche/photocatalysis-europe
 date-released: "2026-11-17"
 # Code under MIT, figures under CC-BY-4.0; see LICENSE.md for which applies where.
-# Third-party licenses (BSD-3-Clause, CC0-1.0, ...) are listed in LICENSE.md, not here.
-license:
-  - MIT
-  - CC-BY-4.0
+license: MIT
 authors:
   - family-names: Tuschewitzki
     given-names: Wolfram
